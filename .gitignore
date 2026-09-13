@@ -101,9 +101,7 @@ llm_backend/app/graphrag/docs/data/**/*.zip
 .vercel
 uv.lock
 
-# 第三方项目与本地产物（与 ShopAssist 无关，不随仓库上传）
-ART-main/
-ART-main.zip
+
 
 # 评测留证：仅解禁简历指标的原始凭据，其余运行日志仍忽略
 !llm_backend/logs/
