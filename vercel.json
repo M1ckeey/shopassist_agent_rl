@@ -1,0 +1,9 @@
+{
+  "experimentalServices": {
+    "web": {
+      "framework": "fastapi",
+      "entrypoint": "llm_backend/main.py",
+      "routePrefix": "/"
+    }
+  }
+}

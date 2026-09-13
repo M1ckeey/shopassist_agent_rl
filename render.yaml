@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: assistgen-agent
+    env: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: DB_TYPE
+        value: sqlite
+      - key: SQLITE_PATH
+        value: /app/data/assistgen.db
+      - key: UPLOAD_DIR
+        value: /app/data/uploads
+      - key: CHAT_SERVICE
+        value: deepseek
+      - key: REASON_SERVICE
+        value: deepseek
+      - key: AGENT_SERVICE
+        value: deepseek
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: VISION_API_KEY
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true

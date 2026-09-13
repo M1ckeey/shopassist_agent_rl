@@ -1,0 +1,3 @@
+:START_ID(Employee),:END_ID(Employee),:TYPE
+2,1,REPORTS_TO
+3,2,REPORTS_TO

@@ -1,0 +1,112 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.env
+.env.*
+!.env.example
+!llm_backend/.env.production.example
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and runtime files
+*.log
+logs/
+log/
+uvicorn-*.out.log
+uvicorn-*.err.log
+
+# Local uploads and generated artifacts
+uploads/
+llm_backend/uploads/
+llm_backend/logs/
+llm_backend/app/lg_agent/logs/
+llm_backend/app/test/logs/
+llm_backend/scripts/logs/
+
+# GraphRAG generated data/cache/output
+llm_backend/app/graphrag/data/cache/
+llm_backend/app/graphrag/data/input/
+llm_backend/app/graphrag/data/logs/
+llm_backend/app/graphrag/data/output/
+llm_backend/app/graphrag/data/pdf_outputs/
+llm_backend/app/graphrag/origin_data/logs/
+llm_backend/app/graphrag/test_data/.env
+
+# Local databases / model files
+*.db
+*.sqlite
+*.sqlite3
+*.parquet.tmp
+*.faiss
+*.pkl
+*.joblib
+llm_backend/codex_upload_test.txt
+
+# Node / frontend build caches
+node_modules/
+.npm/
+.cache/
+
+# Local secrets
+secrets/
+*.pem
+*.key
+# Keep bundled frontend build used by FastAPI static mount
+!llm_backend/static/dist/
+!llm_backend/static/dist/**
+# Large GraphRAG sample/binary data kept locally only
+llm_backend/app/graphrag/data/**/*.pdf
+llm_backend/app/graphrag/test_data/**/*.pdf
+llm_backend/app/graphrag/docs/examples_notebooks/inputs/**/lancedb/
+llm_backend/app/graphrag/examples_notebooks/inputs/**/lancedb/
+llm_backend/app/graphrag/docs/examples_notebooks/inputs/**/*.parquet
+llm_backend/app/graphrag/examples_notebooks/inputs/**/*.parquet
+llm_backend/app/graphrag/docs/data/**/*.zip
+
+.vercel
+uv.lock
+
+# 第三方项目与本地产物（与 ShopAssist 无关，不随仓库上传）
+ART-main/
+ART-main.zip
+
+# 评测留证：仅解禁简历指标的原始凭据，其余运行日志仍忽略
+!llm_backend/logs/
+llm_backend/logs/*
+!llm_backend/logs/eval_suite.jsonl
+!llm_backend/logs/judge_n50_extra20.txt
