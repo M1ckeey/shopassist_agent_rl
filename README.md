@@ -200,11 +200,6 @@ GRAPHRAG_DATA_DIR=data
 GRAPHRAG_QUERY_TYPE=local
 ```
 
-## 项目展示建议
-
-简历中可以写：
-
-> 面向日常购物软件中 AI 客服答复效率低、上下文不连续、售后判断复杂等问题，设计并实现 ShopAssist Agent 智能客服系统，支持订单查询、退款退货判断、商品咨询、图片理解、知识库问答和人工介入判断，提升客服回复准确性和复杂售后问题处理效率。
 
 ## 注意事项
 
@@ -213,6 +208,3 @@ GRAPHRAG_QUERY_TYPE=local
 - 如果聊天很慢，优先检查 Redis / Ollama / embedding 服务是否未启动导致超时。
 - 如果图片理解失败，检查视觉模型 API Key、图片上传接口和前端粘贴图片逻辑。
 
-## 仓库地址
-
-https://github.com/g3182479125-hub/shopassist-agent
