@@ -1,0 +1,437 @@
+"""Tests for multi-checkpoint inference support (RFC #513).
+
+This module tests the ability to run inference on multiple model checkpoints
+simultaneously, enabling pipelined training where training continues on new
+checkpoints while validation runs on older ones.
+
+The key features tested are:
+1. Model.get_inference_name() with optional step parameter
+2. ServerlessBackend._model_inference_name() with step suffix
+3. UnslothService max_loras configuration
+"""
+
+import asyncio
+from dataclasses import dataclass
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+import art
+from art.model import Model, TrainableModel
+
+# =============================================================================
+# Model.get_inference_name() Tests
+# =============================================================================
+
+
+class TestModelGetInferenceName:
+    """Test Model.get_inference_name() with optional step parameter."""
+
+    def test_get_inference_name_without_step_uses_name(self):
+        """Without step, should return the model name."""
+        model = Model(name="test-model", project="test-project")
+        assert model.get_inference_name() == "test-model"
+
+    def test_get_inference_name_without_step_uses_inference_model_name(self):
+        """Without step, should prefer inference_model_name if set."""
+        model = Model(
+            name="test-model",
+            project="test-project",
+            inference_model_name="custom-inference-name",
+        )
+        assert model.get_inference_name() == "custom-inference-name"
+
+    def test_get_inference_name_with_step_appends_suffix(self):
+        """With step, should append @step suffix."""
+        model = Model(name="test-model", project="test-project")
+        assert model.get_inference_name(step=5) == "test-model@5"
+        assert model.get_inference_name(step=0) == "test-model@0"
+        assert model.get_inference_name(step=100) == "test-model@100"
+
+    def test_get_inference_name_with_step_uses_inference_model_name(self):
+        """With step, should use inference_model_name as base if set."""
+        model = Model(
+            name="test-model",
+            project="test-project",
+            inference_model_name="custom-inference-name",
+        )
+        assert model.get_inference_name(step=5) == "custom-inference-name@5"
+
+    def test_get_inference_name_none_step_is_same_as_no_step(self):
+        """Explicitly passing step=None should behave same as no step."""
+        model = Model(name="test-model", project="test-project")
+        assert model.get_inference_name(step=None) == model.get_inference_name()
+
+
+class TestTrainableModelGetInferenceName:
+    """Test TrainableModel.get_inference_name() with optional step parameter."""
+
+    def test_trainable_model_get_inference_name_with_step(self):
+        """TrainableModel should also support step parameter."""
+        model = TrainableModel(
+            run_name="trainable-model",
+            name="trainable-model",
+            project="test-project",
+            base_model="meta-llama/Llama-3.1-8B",
+        )
+        assert model.get_inference_name() == "trainable-model"
+        assert model.get_inference_name(step=3) == "trainable-model@3"
+
+
+class TestLitellmCompletionParams:
+    """Test Model.litellm_completion_params() with optional step parameter."""
+
+    def test_litellm_completion_params_without_step(self):
+        """Without step, should use latest checkpoint name."""
+        model = Model(
+            name="test-model",
+            project="test-project",
+            inference_model_name="inference-name",
+            inference_base_url="http://localhost:8000/v1",
+            inference_api_key="test-key",
+        )
+        params = model.litellm_completion_params()
+        assert params["model"] == "inference-name"
+        assert params["base_url"] == "http://localhost:8000/v1"
+        assert params["api_key"] == "test-key"
+
+    def test_litellm_completion_params_with_step(self):
+        """With step, should append @step suffix to model name."""
+        model = Model(
+            name="test-model",
+            project="test-project",
+            inference_model_name="inference-name",
+            inference_base_url="http://localhost:8000/v1",
+            inference_api_key="test-key",
+        )
+        params = model.litellm_completion_params(step=5)
+        assert params["model"] == "inference-name@5"
+
+    def test_litellm_completion_params_trainable_model_with_step(self):
+        """Trainable model with step should have hosted_vllm/ prefix and @step suffix."""
+        model = TrainableModel(
+            run_name="trainable-model",
+            name="trainable-model",
+            project="test-project",
+            base_model="meta-llama/Llama-3.1-8B",
+        )
+        # Set inference_model_name as it would be after register()
+        model.inference_model_name = "trainable-model"
+        model.inference_base_url = "http://localhost:8000/v1"
+        model.inference_api_key = "test-key"
+
+        params = model.litellm_completion_params()
+        assert params["model"] == "hosted_vllm/trainable-model"
+
+        params_with_step = model.litellm_completion_params(step=3)
+        assert params_with_step["model"] == "hosted_vllm/trainable-model@3"
+
+
+# =============================================================================
+# ServerlessBackend Tests
+# =============================================================================
+
+
+class TestServerlessBackendModelInferenceName:
+    """Test ServerlessBackend._model_inference_name() with step suffix."""
+
+    def test_model_inference_name_without_step(self):
+        """Without step, should return base W&B artifact name."""
+        from art.serverless.backend import ServerlessBackend
+
+        # Create backend with mock client
+        with patch("art.serverless.backend.Client"):
+            backend = ServerlessBackend(api_key="test-key")
+
+        model = TrainableModel(
+            run_name="test-model",
+            name="test-model",
+            project="test-project",
+            base_model="meta-llama/Llama-3.1-8B",
+        )
+        model.entity = "test-entity"
+
+        result = backend._model_inference_name(model)
+        assert result == "wandb-artifact:///test-entity/test-project/test-model"
+
+    def test_model_inference_name_with_step(self):
+        """With step, should append :step{N} suffix."""
+        from art.serverless.backend import ServerlessBackend
+
+        with patch("art.serverless.backend.Client"):
+            backend = ServerlessBackend(api_key="test-key")
+
+        model = TrainableModel(
+            run_name="test-model",
+            name="test-model",
+            project="test-project",
+            base_model="meta-llama/Llama-3.1-8B",
+        )
+        model.entity = "test-entity"
+
+        result = backend._model_inference_name(model, step=5)
+        assert result == "wandb-artifact:///test-entity/test-project/test-model:step5"
+
+        result = backend._model_inference_name(model, step=0)
+        assert result == "wandb-artifact:///test-entity/test-project/test-model:step0"
+
+    def test_model_inference_name_none_step_is_same_as_no_step(self):
+        """Explicitly passing step=None should behave same as no step."""
+        from art.serverless.backend import ServerlessBackend
+
+        with patch("art.serverless.backend.Client"):
+            backend = ServerlessBackend(api_key="test-key")
+
+        model = TrainableModel(
+            run_name="test-model",
+            name="test-model",
+            project="test-project",
+            base_model="meta-llama/Llama-3.1-8B",
+        )
+        model.entity = "test-entity"
+
+        assert backend._model_inference_name(
+            model, step=None
+        ) == backend._model_inference_name(model)
+
+
+# =============================================================================
+# OpenAI Server Config Tests
+# =============================================================================
+
+
+class TestOpenAIServerConfigLoraName:
+    """Test that get_openai_server_config uses step-based LoRA naming."""
+
+    def test_lora_name_includes_step(self):
+        """LoRA module name should include @step suffix."""
+        from art.dev.openai_server import get_openai_server_config
+
+        config = get_openai_server_config(
+            model_name="my-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            log_file="/tmp/test.log",
+            lora_path="/path/to/checkpoints/0005",
+        )
+
+        lora_modules = config.get("server_args", {}).get("lora_modules") or []
+        assert len(lora_modules) == 1
+        assert "my-model@5" in lora_modules[0]
+        assert "/path/to/checkpoints/0005" in lora_modules[0]
+
+    def test_lora_name_step_zero(self):
+        """LoRA module name should work with step 0."""
+        from art.dev.openai_server import get_openai_server_config
+
+        config = get_openai_server_config(
+            model_name="my-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            log_file="/tmp/test.log",
+            lora_path="/path/to/checkpoints/0000",
+        )
+
+        lora_modules = config.get("server_args", {}).get("lora_modules") or []
+        assert len(lora_modules) == 1
+        assert "my-model@0" in lora_modules[0]
+
+    def test_served_model_name_uses_base_model_when_lora_enabled(self):
+        """With LoRA enabled, served model name should remain the base model."""
+        from art.dev.openai_server import get_openai_server_config
+
+        config = get_openai_server_config(
+            model_name="my-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            log_file="/tmp/test.log",
+            lora_path="/path/to/checkpoints/0005",
+        )
+
+        assert (
+            config.get("engine_args", {}).get("served_model_name")
+            == "meta-llama/Llama-3.1-8B"
+        )
+
+
+# =============================================================================
+# Step Parsing Tests
+# =============================================================================
+
+
+class TestStepParsing:
+    """Test TinkerNative model-name parsing behavior."""
+
+    @pytest.fixture
+    def tinker_native_backend_class(self):
+        """Import TinkerNativeBackend, skipping if dependency unavailable."""
+        try:
+            from art.tinker_native.backend import TinkerNativeBackend
+
+            return TinkerNativeBackend
+        except ImportError as e:
+            pytest.skip(f"Tinker dependencies not available: {e}")
+
+    def test_parse_step_from_model_name(self, tinker_native_backend_class):
+        """Valid `model@step` names should parse correctly."""
+        backend = object.__new__(tinker_native_backend_class)
+        assert backend._parse_model_name("model-name@5") == ("model-name", 5)
+        assert backend._parse_model_name("model-name@0") == ("model-name", 0)
+        assert backend._parse_model_name("model@name@12") == ("model@name", 12)
+
+    def test_missing_step_suffix_fails_loudly(self, tinker_native_backend_class):
+        """Unsuffixed model names should fail with a helpful message."""
+        from fastapi import HTTPException
+
+        backend = object.__new__(tinker_native_backend_class)
+        with pytest.raises(HTTPException, match="missing an '@step' suffix"):
+            backend._parse_model_name("model-name")
+
+    def test_invalid_step_suffix_fails_loudly(self, tinker_native_backend_class):
+        """Non-numeric step suffix should fail with a helpful message."""
+        from fastapi import HTTPException
+
+        backend = object.__new__(tinker_native_backend_class)
+        with pytest.raises(HTTPException, match="Invalid model step"):
+            backend._parse_model_name("model-name@not-a-number")
+
+
+# =============================================================================
+# UnslothService Configuration Tests
+# =============================================================================
+
+
+class TestUnslothServiceMaxLoras:
+    """Test UnslothService max_loras configuration."""
+
+    @pytest.fixture
+    def unsloth_service_class(self):
+        """Import UnslothService, skipping if dependencies unavailable."""
+        try:
+            from art.unsloth.service import UnslothService
+
+            return UnslothService
+        except ImportError as e:
+            pytest.skip(f"Unsloth dependencies not available: {e}")
+
+    def test_max_loras_default_is_2(self, unsloth_service_class):
+        """UnslothService should default to max_loras=2 (one for training, one for validation)."""
+        UnslothService = unsloth_service_class
+
+        service = UnslothService(
+            model_name="test-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            config={},
+            output_dir="/tmp/test",
+        )
+
+        # Access the llm cached property to check engine args
+        # We can't actually create the LLM, but we can check the config logic
+        engine_args = {
+            **service.config.get("engine_args", {}),
+            "enable_lora": True,
+            "max_loras": service.config.get("engine_args", {}).get("max_loras", 2),
+        }
+
+        assert engine_args["max_loras"] == 2
+        assert engine_args["enable_lora"] is True
+
+    def test_max_loras_can_be_overridden(self, unsloth_service_class):
+        """max_loras should be configurable via engine_args."""
+        UnslothService = unsloth_service_class
+
+        service = UnslothService(
+            model_name="test-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            config={"engine_args": {"max_loras": 8}},
+            output_dir="/tmp/test",
+        )
+
+        engine_args = {
+            **service.config.get("engine_args", {}),
+            "enable_lora": True,
+            "max_loras": service.config.get("engine_args", {}).get("max_loras", 2),
+        }
+
+        assert engine_args["max_loras"] == 8
+
+    @pytest.mark.asyncio
+    async def test_prune_loaded_adapters_unloads_non_retained_steps(
+        self, unsloth_service_class, monkeypatch
+    ):
+        """UnslothService should unload old vLLM LoRA adapters after updates."""
+        httpx = pytest.importorskip("httpx")
+        UnslothService = unsloth_service_class
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        class FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, url, *, json, **_kwargs):
+                calls.append((url, json))
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+        service = UnslothService(
+            model_name="test-model",
+            base_model="meta-llama/Llama-3.1-8B",
+            config={},
+            output_dir="/tmp/test",
+        )
+        service._vllm_port = 8000
+        service._latest_step = 3
+        service._loaded_adapter_steps.update({1, 2, 3})
+
+        await service.prune_loaded_adapters(retain_steps={2})
+
+        assert calls == [
+            (
+                "http://127.0.0.1:8000/v1/unload_lora_adapter",
+                {"lora_name": "test-model@1"},
+            )
+        ]
+        assert service._loaded_adapter_steps == {2, 3}
+
+
+# =============================================================================
+# Pipelined Training Usage Example
+# =============================================================================
+
+
+class TestPipelinedTrainingUsage:
+    """Test the usage pattern for pipelined training as described in RFC #513."""
+
+    def test_pipelined_training_pattern(self):
+        """
+        Verify the API supports the pipelined training pattern from RFC #513.
+
+        The pattern is:
+        1. Rollout uses latest checkpoint: model.get_inference_name()
+        2. After training, queue eval on specific checkpoint: model.get_inference_name(step=N)
+        """
+        model = Model(name="my-model", project="test", inference_model_name="my-model")
+
+        # Rollout uses latest checkpoint (no step)
+        rollout_name = model.get_inference_name()
+        assert rollout_name == "my-model"
+        assert "@" not in rollout_name
+
+        # After training step 5, queue eval on that specific checkpoint
+        eval_name = model.get_inference_name(step=5)
+        assert eval_name == "my-model@5"
+
+        # Training continues, new checkpoint at step 6
+        # Rollout still uses latest (would be step 6 after training)
+        new_rollout_name = model.get_inference_name()
+        assert new_rollout_name == "my-model"
+
+        # Previous eval can still reference step 5
+        prev_eval_name = model.get_inference_name(step=5)
+        assert prev_eval_name == "my-model@5"

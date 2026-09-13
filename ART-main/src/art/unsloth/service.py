@@ -1,0 +1,774 @@
+"""Unsloth training service with decoupled vLLM inference."""
+
+import asyncio
+from dataclasses import dataclass, field
+from functools import cached_property
+import hashlib
+import logging
+import os
+from typing import Any, AsyncIterator, Literal, TypedDict, cast
+
+import torch
+from trl import GRPOTrainer
+
+from .. import dev, types
+from ..adapter_leases import in_flight_lora_name
+from ..dev.validate import is_dedicated_mode
+from ..local.checkpoints import get_last_checkpoint_dir
+from ..preprocessing.pack import DiskPackedTensors
+from ..preprocessing.tokenize import SFTBatch
+from ..serving_capabilities import (
+    ServingCapabilities,
+    discover_serving_capabilities,
+)
+from ..utils.convert_moe_lora import convert_checkpoint_if_needed
+from ..utils.get_model_step import get_step_from_dir
+from ..utils.lifecycle import (
+    ChildProcessSupervisor,
+    ServiceLifecycle,
+    cleanup_after_failure,
+)
+from ..utils.output_dirs import get_step_checkpoint_dir
+from ..vllm_runtime import (
+    ManagedVllmRuntime,
+    VllmRuntimeLaunchConfig,
+)
+from .train import (
+    UnslothTrainContext,
+    create_unsloth_train_context,
+    gc_and_empty_cuda_cache,
+    run_unsloth_rl_training,
+    run_unsloth_sft_training,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _peft_args_from_lora_config(lora_config: dev.LoRAConfig) -> dict[str, Any]:
+    aliases = {
+        "rank": "r",
+        "alpha": "lora_alpha",
+        "dropout": "lora_dropout",
+        "init_weights": "init_lora_weights",
+    }
+    return {
+        "r": 8,
+        "lora_alpha": 16,
+        **{aliases.get(k, k): v for k, v in lora_config.items()},
+    }
+
+
+class _RuntimeRequestKwargs(TypedDict, total=False):
+    headers: dict[str, str]
+
+
+def save_checkpoint(
+    trainer: "GRPOTrainer",
+    output_dir: str,
+    verbose: bool = False,
+) -> str:
+    """Save a checkpoint and return the checkpoint directory path."""
+    # _use_adapter() may load reference adapters for KL/logprob computation and
+    # keep them attached to the PEFT model. Before saving, keep only active
+    # adapter(s) and drop the rest to release GPU/CPU memory.
+    try:
+        peft_model = trainer.accelerator.unwrap_model(  # type: ignore[attr-defined]
+            trainer.model, keep_fp32_wrapper=False
+        )
+        active_adapters = peft_model.active_adapter
+        if isinstance(active_adapters, str):
+            keep_adapters = {active_adapters}
+        else:
+            keep_adapters = set(active_adapters)
+
+        before_adapters = list(peft_model.peft_config.keys())
+        print(f"Adapters before cleanup: {before_adapters}")
+        print(f"Keeping active adapter(s): {sorted(keep_adapters)}")
+
+        for adapter_name in before_adapters:
+            if adapter_name not in keep_adapters:
+                peft_model.delete_adapter(adapter_name)
+                print(f"Deleted unused adapter: {adapter_name}")
+
+        after_adapters = list(peft_model.peft_config.keys())
+        print(f"Adapters after cleanup: {after_adapters}")
+    except Exception as e:
+        print(f"Warning: failed to cleanup unused adapters: {e}")
+
+    if verbose:
+        print("Saving new LoRA adapter...")
+    next_step = get_step_from_dir(output_dir) + 1
+    checkpoint_dir = get_step_checkpoint_dir(output_dir, next_step)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    trainer.save_model(checkpoint_dir)
+    convert_checkpoint_if_needed(checkpoint_dir)
+
+    gc_and_empty_cuda_cache()
+    return checkpoint_dir
+
+
+# ============================================================================
+# Service
+# ============================================================================
+
+
+@dataclass
+class UnslothService:
+    model_name: str
+    base_model: str
+    config: dev.InternalModelConfig
+    output_dir: str
+    _is_sleeping: bool = False
+    _latest_step: int = 0
+    _vllm_runtime: ManagedVllmRuntime = field(
+        default_factory=ManagedVllmRuntime,
+        init=False,
+        repr=False,
+    )
+    _lifecycle: ServiceLifecycle = field(
+        default_factory=ServiceLifecycle,
+        init=False,
+        repr=False,
+    )
+    _child_processes: ChildProcessSupervisor = field(init=False, repr=False)
+    _loaded_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _loaded_exact_adapter_steps: set[int] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_refcounts: dict[int, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _exact_adapter_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _serving_capabilities: ServingCapabilities | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
+
+    def _on_child_process_exit(self, error: RuntimeError) -> None:
+        logger.error("%s", error)
+        self.close()
+
+    def _raise_if_child_failed(self) -> None:
+        self._child_processes.raise_if_failed()
+
+    @property
+    def is_dedicated(self) -> bool:
+        return is_dedicated_mode(self.config)
+
+    @property
+    def rollout_weight_update_mode(self) -> Literal["step_lora", "in_flight_lora"]:
+        mode = self.config.get("rollout_weight_update_mode", "step_lora")
+        assert mode in {"step_lora", "in_flight_lora"}
+        return mode
+
+    @property
+    def _in_flight_lora_slot(self) -> str:
+        return in_flight_lora_name(self.model_name)
+
+    @property
+    def _initial_served_model_name(self) -> str:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return self._in_flight_lora_slot
+        return f"{self.model_name}@{self._latest_step}"
+
+    def _exact_lora_name(self, step: int) -> str:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return f"{self.model_name}:eval@{step}"
+        return f"{self.model_name}@{step}"
+
+    def _generation_id(self, step: int) -> str:
+        return f"{self.model_name}@{step}"
+
+    @property
+    def _vllm_base_url(self) -> str:
+        return self._vllm_runtime.base_url
+
+    @property
+    def _vllm_host(self) -> str:
+        return self._vllm_runtime.host
+
+    @property
+    def _vllm_port(self) -> int:
+        return self._vllm_runtime.port
+
+    @_vllm_port.setter
+    def _vllm_port(self, port: int) -> None:
+        self._vllm_runtime.port = port
+
+    @property
+    def _vllm_api_key(self) -> str | None:
+        return self._vllm_runtime.api_key
+
+    def _runtime_cuda_visible_devices(self) -> str:
+        if self.is_dedicated:
+            return ",".join(str(gpu_id) for gpu_id in self.config["inference_gpu_ids"])
+        if visible := os.environ.get("CUDA_VISIBLE_DEVICES"):
+            return visible
+        return ",".join(str(index) for index in range(torch.cuda.device_count()))
+
+    def _runtime_engine_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        engine_args = dict(self.config.get("engine_args", {}))
+        if config and "engine_args" in config:
+            engine_args.update(dict(config["engine_args"]))
+        engine_args.setdefault("generation_config", "vllm")
+        engine_args["enable_lora"] = True
+        engine_args.setdefault("max_loras", 2)
+        for key in ("model", "served_model_name"):
+            engine_args.pop(key, None)
+        return engine_args
+
+    def _runtime_server_args(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> dict[str, object]:
+        server_args: dict[str, object] = {
+            "return_tokens_as_token_ids": True,
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+        }
+        if config and "server_args" in config:
+            server_args.update(dict(config["server_args"]))
+        for key in ("port", "host", "lora_modules"):
+            server_args.pop(key, None)
+        return server_args
+
+    def _runtime_headers(self) -> dict[str, str]:
+        if self._vllm_api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self._vllm_api_key}"}
+
+    def _runtime_request_kwargs(self) -> _RuntimeRequestKwargs:
+        headers = self._runtime_headers()
+        return {"headers": headers} if headers else {}
+
+    @property
+    def serving_capabilities(self) -> ServingCapabilities:
+        if self._serving_capabilities is None:
+            raise RuntimeError("vLLM serving capabilities have not been discovered")
+        return self._serving_capabilities
+
+    async def get_serving_capabilities(self) -> ServingCapabilities:
+        return self.serving_capabilities
+
+    def _sleep_mode_enabled(self) -> bool:
+        return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
+
+    async def aclose(self) -> None:
+        state = self.__dict__.get("_state")
+        if isinstance(state, UnslothTrainContext):
+            await state.stop_background_training()
+        self.close()
+
+    # =========================================================================
+    # Dedicated mode: vLLM subprocess lifecycle
+    # =========================================================================
+
+    async def _start_vllm_subprocess(
+        self,
+        lora_path: str,
+        port: int,
+        config: dev.OpenAIServerConfig | None = None,
+    ) -> tuple[str, int]:
+        self._raise_if_child_failed()
+        server_args = self._runtime_server_args(config)
+        location = await self._vllm_runtime.start(
+            launch_config=VllmRuntimeLaunchConfig(
+                base_model=self.base_model,
+                port=port,
+                host=self._vllm_runtime.host,
+                cuda_visible_devices=self._runtime_cuda_visible_devices(),
+                lora_path=lora_path,
+                served_model_name=self._initial_served_model_name,
+                initial_generation_id=(
+                    self._generation_id(self._latest_step)
+                    if self.rollout_weight_update_mode == "in_flight_lora"
+                    else None
+                ),
+                initial_policy_version=(
+                    self._latest_step
+                    if self.rollout_weight_update_mode == "in_flight_lora"
+                    else None
+                ),
+                engine_args=self._runtime_engine_args(config),
+                server_args=server_args,
+            ),
+            output_dir=self.output_dir,
+            child_processes=self._child_processes,
+            install_parent_cleanup=lambda: self._lifecycle.install_parent_cleanup(
+                self.close
+            ),
+            cleanup_on_error=self.close,
+        )
+        logger.info(
+            "vLLM runtime ready on port %d (GPUs: %s)",
+            port,
+            self._runtime_cuda_visible_devices(),
+        )
+        return location
+
+    async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
+        """Reload LoRA adapter in vLLM subprocess via HTTP."""
+        import httpx
+
+        self._raise_if_child_failed()
+        lora_name = f"{self.model_name}@{step}"
+        logger.info(
+            f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
+            f"path={checkpoint_path}"
+        )
+        payload: dict[str, Any] = {
+            "lora_name": lora_name,
+            "lora_path": checkpoint_path,
+        }
+        if self.serving_capabilities.inplace_lora_load:
+            payload["load_inplace"] = True
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/v1/load_lora_adapter",
+                json=payload,
+                **self._runtime_request_kwargs(),
+                timeout=60.0,
+            )
+            response.raise_for_status()
+        logger.info(
+            f"[DEDICATED] _reload_adapter DONE: lora_name={lora_name} "
+            f"status={response.status_code}"
+        )
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _update_in_flight_adapter(self, checkpoint_path: str, step: int) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        self.serving_capabilities.require(
+            "in_flight_lora_updates", operation="In-flight LoRA updates"
+        )
+        self.serving_capabilities.require(
+            "policy_token_spans", operation="In-flight LoRA updates"
+        )
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/art/in_flight_lora_update",
+                json={
+                    "operation_id": hashlib.sha256(
+                        f"{self._in_flight_lora_slot}\0{self._generation_id(step)}".encode()
+                    ).hexdigest(),
+                    "model_name": self._in_flight_lora_slot,
+                    "lora_slot": self._in_flight_lora_slot,
+                    "lora_path": checkpoint_path,
+                    "generation_id": self._generation_id(step),
+                    "expected_generation_id": self._generation_id(self._latest_step),
+                    "policy_version": step,
+                },
+                **self._runtime_request_kwargs(),
+                timeout=60.0,
+            )
+            response.raise_for_status()
+        self._latest_step = step
+        self._loaded_adapter_steps.add(step)
+
+    async def _load_rollout_lora_for_step(
+        self, checkpoint_path: str, step: int
+    ) -> None:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            await self._update_in_flight_adapter(checkpoint_path, step)
+        else:
+            await self._reload_adapter(checkpoint_path, step)
+
+    async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str:
+        lora_name = self._exact_lora_name(step)
+        async with self._exact_adapter_lock:
+            loaded_steps = (
+                self._loaded_exact_adapter_steps
+                if self.rollout_weight_update_mode == "in_flight_lora"
+                else self._loaded_adapter_steps
+            )
+            if step in loaded_steps:
+                if self.rollout_weight_update_mode == "in_flight_lora":
+                    self._exact_adapter_refcounts[step] += 1
+                return lora_name
+            import httpx
+
+            self._raise_if_child_failed()
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self._vllm_base_url}/v1/load_lora_adapter",
+                    json={
+                        "lora_name": lora_name,
+                        "lora_path": checkpoint_path,
+                    },
+                    **self._runtime_request_kwargs(),
+                    timeout=60.0,
+                )
+                response.raise_for_status()
+            loaded_steps.add(step)
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                self._exact_adapter_refcounts[step] = 1
+        return lora_name
+
+    async def release_exact_adapter(self, step: int) -> None:
+        if self.rollout_weight_update_mode != "in_flight_lora":
+            return
+        async with self._exact_adapter_lock:
+            count = self._exact_adapter_refcounts[step]
+            if count > 1:
+                self._exact_adapter_refcounts[step] = count - 1
+                return
+            await self._unload_exact_adapter(step)
+            del self._exact_adapter_refcounts[step]
+
+    async def resolve_global_grad_accumulation_sequences(
+        self, config: types.TrainConfig
+    ) -> int:
+        configured = int(
+            self.config.get("trainer_args", {}).get("gradient_accumulation_steps", 1)
+        )
+        if configured < 1:
+            raise ValueError("Unsloth gradient accumulation must be >= 1")
+        requested = config.grad_accumulation_sequences
+        if requested is not None and requested != configured:
+            raise ValueError(
+                "UnslothService is configured for "
+                f"grad_accumulation_sequences={configured}, got {requested}"
+            )
+        return configured
+
+    async def _unload_adapter_name(self, lora_name: str) -> bool:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/v1/unload_lora_adapter",
+                json={"lora_name": lora_name},
+                **self._runtime_request_kwargs(),
+                timeout=30.0,
+            )
+            if response.status_code == 404:
+                return False
+            response.raise_for_status()
+        return True
+
+    async def _unload_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(f"{self.model_name}@{step}")
+        self._loaded_adapter_steps.discard(step)
+
+    async def _unload_exact_adapter(self, step: int) -> None:
+        await self._unload_adapter_name(self._exact_lora_name(step))
+        self._loaded_exact_adapter_steps.discard(step)
+
+    async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
+        if self._vllm_port == 0:
+            return
+        async with self._exact_adapter_lock:
+            for step in sorted(self._loaded_exact_adapter_steps - retain_steps):
+                if self._exact_adapter_refcounts.get(step, 0) == 0:
+                    await self._unload_exact_adapter(step)
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return
+        for step in sorted(self._loaded_adapter_steps - retain_steps):
+            if step == self._latest_step:
+                continue
+            await self._unload_adapter(step)
+
+    def close(self) -> None:
+        """Terminate vLLM subprocess if running."""
+        if not self._lifecycle.begin_close():
+            return
+        try:
+            self._child_processes.close()
+            self._vllm_runtime.close()
+            self._loaded_adapter_steps.clear()
+            self._loaded_exact_adapter_steps.clear()
+            self._exact_adapter_refcounts.clear()
+        finally:
+            self._lifecycle.restore_parent_cleanup()
+
+    # =========================================================================
+    # start_openai_server
+    # =========================================================================
+
+    async def start_openai_server(
+        self, config: dev.OpenAIServerConfig | None
+    ) -> tuple[str, int]:
+        self._raise_if_child_failed()
+        lora_path = get_last_checkpoint_dir(self.output_dir)
+        if lora_path is None:
+            lora_path = get_step_checkpoint_dir(self.output_dir, 0)
+            os.makedirs(os.path.dirname(lora_path), exist_ok=True)
+            self._state.trainer.save_model(lora_path)
+            convert_checkpoint_if_needed(lora_path)
+            self._latest_step = 0
+        else:
+            self._latest_step = get_step_from_dir(self.output_dir)
+
+        if not self.is_dedicated:
+            if not self._sleep_mode_enabled():
+                raise ValueError(
+                    "Shared-GPU mode requires engine_args.enable_sleep_mode=True "
+                    "for the external vLLM runtime"
+                )
+            self._state.offload_to_cpu()
+
+        port = (config or {}).get("server_args", {}).get("port", 8000)
+        vllm_location = await self._start_vllm_subprocess(
+            lora_path,
+            port,
+            config=config,
+        )
+        try:
+            self._serving_capabilities = await discover_serving_capabilities(
+                base_url=self._vllm_base_url,
+                headers=self._runtime_headers(),
+                allow_openai_compatible=False,
+            )
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                await self._update_in_flight_adapter(lora_path, self._latest_step)
+            else:
+                self._loaded_adapter_steps.add(self._latest_step)
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="vLLM startup and Unsloth cleanup failed.",
+            )
+            raise
+        return vllm_location
+
+    async def vllm_engine_is_sleeping(self) -> bool:
+        return self._is_sleeping
+
+    async def _sleep_runtime(self) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/sleep",
+                params={"level": 1, "mode": "wait"},
+                **self._runtime_request_kwargs(),
+                timeout=300.0,
+            )
+            response.raise_for_status()
+        self._is_sleeping = True
+
+    async def _wake_runtime(self) -> None:
+        import httpx
+
+        self._raise_if_child_failed()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self._vllm_base_url}/wake_up",
+                **self._runtime_request_kwargs(),
+                timeout=300.0,
+            )
+            response.raise_for_status()
+        self._is_sleeping = False
+
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
+        await self._load_rollout_lora_for_step(checkpoint_dir, step)
+        self._latest_step = step
+
+    async def train(
+        self,
+        disk_packed_tensors: DiskPackedTensors,
+        config: types.TrainConfig,
+        _config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        try:
+            self._raise_if_child_failed()
+            if self.is_dedicated:
+                async for result in self._train_dedicated(
+                    disk_packed_tensors, config, _config, verbose
+                ):
+                    yield result
+                return
+
+            async for result in self._train_shared(
+                disk_packed_tensors, config, _config, verbose
+            ):
+                yield result
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Unsloth training and cleanup failed.",
+            )
+            raise
+
+    async def _train_dedicated(
+        self,
+        disk_packed_tensors: DiskPackedTensors,
+        config: types.TrainConfig,
+        _config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train in dedicated mode — no sleep/wake, vLLM keeps running on separate GPU."""
+        async for result in run_unsloth_rl_training(
+            self._state,
+            disk_packed_tensors=disk_packed_tensors,
+            config=config,
+            _config=_config,
+            verbose=verbose,
+        ):
+            yield result
+
+        checkpoint_dir = save_checkpoint(
+            trainer=self._state.trainer,
+            output_dir=self.output_dir,
+            verbose=verbose,
+        )
+
+        new_step = int(os.path.basename(checkpoint_dir))
+        logger.info(
+            "[DEDICATED] _train_dedicated: saved checkpoint step=%s, reloading adapter...",
+            new_step,
+        )
+        await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
+        self._latest_step = new_step
+        logger.info(
+            f"[DEDICATED] _train_dedicated: inference weights updated for step {new_step}"
+        )
+
+    async def _train_shared(
+        self,
+        disk_packed_tensors: DiskPackedTensors,
+        config: types.TrainConfig,
+        _config: dev.TrainConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        await self._sleep_runtime()
+        gc_and_empty_cuda_cache()
+        self._state.reload_to_gpu()
+
+        async for result in run_unsloth_rl_training(
+            self._state,
+            disk_packed_tensors=disk_packed_tensors,
+            config=config,
+            _config=_config,
+            verbose=verbose,
+        ):
+            yield result
+
+        checkpoint_dir = save_checkpoint(
+            trainer=self._state.trainer,
+            output_dir=self.output_dir,
+            verbose=verbose,
+        )
+
+        self._state.offload_to_cpu()
+        gc_and_empty_cuda_cache()
+        await asyncio.sleep(0.5)
+        await self._wake_runtime()
+
+        new_step = int(os.path.basename(checkpoint_dir))
+        await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
+        self._latest_step = new_step
+
+        if verbose:
+            print("UnslothService.train complete")
+
+    # =========================================================================
+    # SFT training
+    # =========================================================================
+
+    async def train_sft(
+        self,
+        batches: list[SFTBatch],
+        config: types.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train using SFT on pre-computed batches.
+
+        Args:
+            batches: List of SFTBatch objects to train on.
+            config: SFT batch/grad-accumulation configuration.
+            verbose: Whether to print detailed logs.
+
+        Yields:
+            Dictionary containing training metrics for each batch.
+        """
+        try:
+            self._raise_if_child_failed()
+            if self.is_dedicated:
+                raise NotImplementedError(
+                    "train_sft is not yet supported in dedicated mode"
+                )
+
+            await self._sleep_runtime()
+            gc_and_empty_cuda_cache()
+            self._state.reload_to_gpu()
+            if verbose:
+                print("SFT training started")
+
+            async for result in run_unsloth_sft_training(
+                self._state,
+                batches,
+                verbose=verbose,
+                max_grad_norm=1.0,
+            ):
+                yield {
+                    "loss/train": result["loss"],
+                    "loss/learning_rate": result["learning_rate"],
+                    "loss/grad_norm": result["grad_norm"],
+                }
+
+            checkpoint_dir = save_checkpoint(
+                trainer=self._state.trainer,
+                output_dir=self.output_dir,
+                verbose=verbose,
+            )
+
+            self._state.offload_to_cpu()
+            gc_and_empty_cuda_cache()
+            await asyncio.sleep(0.5)
+            await self._wake_runtime()
+            new_step = int(os.path.basename(checkpoint_dir))
+            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
+            self._latest_step = new_step
+
+            if verbose:
+                print("SFT training finished")
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Unsloth SFT training and cleanup failed.",
+            )
+            raise
+
+    @cached_property
+    def _state(self) -> UnslothTrainContext:
+        init_args = dict(self.config.get("init_args", {}))
+        checkpoint_dir = get_last_checkpoint_dir(self.output_dir)
+        init_args["model_name"] = checkpoint_dir or self.base_model
+        return create_unsloth_train_context(
+            init_args=init_args,
+            peft_args=_peft_args_from_lora_config(
+                cast(dev.BackendModelConfig, self.config).get("lora_config", {})
+            ),
+            trainer_args=cast(dict[str, Any], self.config.get("trainer_args", {})),
+        )

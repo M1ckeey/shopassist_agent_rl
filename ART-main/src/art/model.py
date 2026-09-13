@@ -1,0 +1,1788 @@
+from contextlib import contextmanager, nullcontext
+from contextvars import Token
+from datetime import datetime
+import json
+import os
+import time
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Iterable,
+    Literal,
+    Optional,
+    cast,
+    overload,
+)
+import warnings
+
+from openai import (
+    DEFAULT_CONNECTION_LIMITS,
+    DEFAULT_TIMEOUT,
+    APIConnectionError,
+    AsyncOpenAI,
+    DefaultAsyncHttpxClient,
+)
+import polars as pl
+from pydantic import BaseModel
+from typing_extensions import Never, TypeVar
+
+from . import dev
+from .costs import CostCalculator
+from .errors import LocalServingUnavailableError
+from .metrics import MetricsBuilder, is_builder_managed_metric
+from .metrics_taxonomy import (
+    SFT_GRADIENT_STEP_KEY,
+    SFT_METRIC_PREFIX,
+    SFT_WANDB_GRADIENT_STEP_KEY,
+    average_metric_samples,
+    build_data_metrics_from_summary,
+    summarize_trajectory_groups,
+)
+from .preprocessing.policy_spans import (
+    POLICY_TOKEN_SPANS_KEY,
+    PROMPT_POLICY_TOKEN_SPANS_KEY,
+    attach_policy_token_metadata_to_choice,
+    attach_static_policy_token_span_to_choice,
+    choice_policy_token_spans,
+    validate_complete_policy_token_spans,
+    validate_complete_prompt_policy_token_spans,
+)
+from .preprocessing.vllm_tokens import (
+    attach_completion_token_metadata,
+    attach_vllm_token_metadata_to_choice,
+    choice_completion_tokens,
+    choice_vllm_token_metadata,
+)
+from .serving_capabilities import ServingCapabilities
+from .trajectories import Trajectory, TrajectoryGroup
+from .types import SFTMetricLoggingConfig, TrainSFTConfig
+from .utils import wandb_sdk
+from .utils.trajectory_logging import write_trajectory_groups_parquet
+from .vllm_route_transport import decode_routed_experts_response
+
+if TYPE_CHECKING:
+    from wandb.sdk.wandb_run import Run
+
+    from art.backend import Backend
+
+
+ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
+StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
+
+METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
+
+
+@contextmanager
+def _suppress_weave_trace():
+    from weave.trace.settings import override_settings
+
+    with override_settings(disabled=True):
+        yield
+
+
+def _merge_extra_body_defaults(
+    defaults: dict[str, Any],
+    provided: Any,
+) -> Any:
+    if provided is None:
+        return {**defaults}
+    if not isinstance(provided, dict):
+        return provided
+
+    merged = {**defaults}
+    for key, value in provided.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def _attach_response_art_metadata(
+    response: Any,
+    routed_experts: dict[int, Any] | None = None,
+    policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+    request_model: str | None = None,
+) -> None:
+    choices = getattr(response, "choices", None)
+    model_dump = getattr(response, "model_dump", None)
+    if not choices or not callable(model_dump):
+        return
+    response_payload = model_dump(mode="python")
+    if routed_experts is not None:
+        from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
+
+        missing = [
+            int(choice.index)
+            for choice in choices
+            if int(choice.index) not in routed_experts
+        ]
+        if missing:
+            raise RuntimeError(
+                "ART binary response omitted routed experts for choice indices "
+                f"{missing}; received {sorted(routed_experts)}"
+            )
+    for choice_index, choice in enumerate(choices):
+        attach_vllm_token_metadata_to_choice(
+            choice=choice,
+            response_payload=response_payload,
+            choice_index=choice_index,
+        )
+    attach_completion_token_metadata(response)
+    for choice_index, choice in enumerate(choices):
+        if routed_experts is not None:
+            attach_moe_routing_metadata_to_choice(
+                choice=choice,
+                response_payload=response_payload,
+                choice_index=choice_index,
+                routed_experts=routed_experts.get(int(choice.index)),
+            )
+        attach_policy_token_metadata_to_choice(
+            choice=choice,
+            response_payload=response_payload,
+            choice_index=choice_index,
+        )
+        if policy_span_mode == "synthesize" and not choice_policy_token_spans(choice):
+            completion_tokens = choice_completion_tokens(choice)
+            token_metadata = choice_vllm_token_metadata(choice)
+            if completion_tokens is None or completion_tokens <= 0:
+                raise RuntimeError(
+                    "Immutable step-LoRA policy tracking requires a positive exact "
+                    "per-choice completion token count."
+                )
+            if token_metadata is None:
+                raise RuntimeError(
+                    "Immutable step-LoRA policy tracking requires exact prompt tokens."
+                )
+            attach_static_policy_token_span_to_choice(
+                choice=choice,
+                model_name=request_model or "",
+                prompt_tokens=len(token_metadata[0]),
+                completion_tokens=completion_tokens,
+            )
+        if policy_span_mode != "none":
+            token_metadata = choice_vllm_token_metadata(choice)
+            if token_metadata is None:
+                raise RuntimeError("Policy tracking requires exact prompt token IDs.")
+            prompt_tokens = len(token_metadata[0])
+            extra = choice.model_extra or {}
+            if PROMPT_POLICY_TOKEN_SPANS_KEY not in extra:
+                raise RuntimeError(
+                    "Policy tracking requires prompt_policy_token_spans."
+                )
+            if POLICY_TOKEN_SPANS_KEY not in extra:
+                raise RuntimeError("Policy tracking requires policy_token_spans.")
+            validate_complete_prompt_policy_token_spans(
+                choice, prompt_tokens=prompt_tokens
+            )
+            completion_tokens = choice_completion_tokens(choice)
+            if completion_tokens is None or completion_tokens <= 0:
+                raise RuntimeError(
+                    "Policy tracking requires a positive exact per-choice completion "
+                    "token count."
+                )
+            validate_complete_policy_token_spans(
+                choice, completion_tokens=completion_tokens
+            )
+
+
+class _OpenAIChatCompletionsProxy:
+    def __init__(
+        self,
+        completions: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+        managed_serving_base_url: str | None = None,
+        binary_completions: Any | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+        suppress_weave_trace: bool = False,
+    ) -> None:
+        self._completions = completions
+        self._record_costs = record_costs
+        self._default_extra_body = default_extra_body
+        self._managed_serving_base_url = managed_serving_base_url
+        self._binary_completions = binary_completions
+        self._policy_span_mode = policy_span_mode
+        self._suppress_weave_trace = suppress_weave_trace
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        if self._policy_span_mode == "synthesize" and kwargs.get("stream", False):
+            raise ValueError(
+                "Streaming completions require runtime-provided policy-token spans."
+            )
+        if self._default_extra_body is not None:
+            kwargs["extra_body"] = _merge_extra_body_defaults(
+                self._default_extra_body,
+                kwargs.get("extra_body"),
+            )
+        # Local vLLM responses carry token IDs, logprobs, routed experts, and
+        # policy-span metadata that ART needs for training. Weave's OpenAI
+        # integration serializes the whole response by default, which can turn a
+        # long RL run into hundreds of GB of trace payload. Keep the production
+        # training response intact and suppress only this implicit trace.
+        try:
+            with (
+                _suppress_weave_trace() if self._suppress_weave_trace else nullcontext()
+            ):
+                if self._binary_completions is None:
+                    response = await self._completions.create(*args, **kwargs)
+                    routed_experts = None
+                else:
+                    raw_response = (
+                        await self._binary_completions.with_raw_response.create(
+                            *args, **kwargs
+                        )
+                    )
+                    response, routed_experts = decode_routed_experts_response(
+                        raw_response.content
+                    )
+        except APIConnectionError as exc:
+            if self._managed_serving_base_url is not None:
+                raise LocalServingUnavailableError(
+                    "ART-managed inference endpoint became unreachable "
+                    f"at {self._managed_serving_base_url}. Aborting training instead "
+                    "of counting rollouts as data errors."
+                ) from exc
+            raise
+        request_model = kwargs.get("model")
+        if self._policy_span_mode != "none" and not isinstance(request_model, str):
+            raise RuntimeError("OpenAI completion model must be a string")
+        if kwargs.get("stream", False):
+            if self._policy_span_mode == "require":
+                setattr(response, "_art_require_policy_spans", True)
+            self._record_costs(response)
+            return response
+        _attach_response_art_metadata(
+            response,
+            routed_experts,
+            self._policy_span_mode,
+            request_model,
+        )
+        self._record_costs(response)
+        return response
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._completions, name)
+
+
+class _OpenAIChatProxy:
+    def __init__(
+        self,
+        chat: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+        managed_serving_base_url: str | None = None,
+        binary_chat: Any | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+        suppress_weave_trace: bool = False,
+    ) -> None:
+        self._chat = chat
+        self.completions = _OpenAIChatCompletionsProxy(
+            chat.completions,
+            record_costs,
+            default_extra_body,
+            managed_serving_base_url,
+            binary_chat.completions if binary_chat is not None else None,
+            policy_span_mode,
+            suppress_weave_trace,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chat, name)
+
+
+class _OpenAIClientProxy:
+    def __init__(
+        self,
+        client: Any,
+        record_costs: Any,
+        default_extra_body: dict[str, Any] | None = None,
+        managed_serving_base_url: str | None = None,
+        binary_routes_base_url: str | None = None,
+        policy_span_mode: Literal["none", "require", "synthesize"] = "none",
+        suppress_weave_trace: bool = False,
+    ) -> None:
+        self._client = client
+        self._record_costs = record_costs
+        self._default_extra_body = default_extra_body
+        self._managed_serving_base_url = managed_serving_base_url
+        self._binary_routes_base_url = binary_routes_base_url
+        self._policy_span_mode = policy_span_mode
+        self._suppress_weave_trace = suppress_weave_trace
+        binary_client = (
+            client.with_options(base_url=binary_routes_base_url)
+            if binary_routes_base_url is not None
+            else None
+        )
+        self.chat = _OpenAIChatProxy(
+            client.chat,
+            record_costs,
+            default_extra_body,
+            managed_serving_base_url,
+            binary_client.chat if binary_client is not None else None,
+            policy_span_mode,
+            suppress_weave_trace,
+        )
+
+    def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
+        return _OpenAIClientProxy(
+            self._client.with_options(*args, **kwargs),
+            self._record_costs,
+            self._default_extra_body,
+            self._managed_serving_base_url,
+            self._binary_routes_base_url,
+            self._policy_span_mode,
+            self._suppress_weave_trace,
+        )
+
+    async def __aenter__(self) -> "_OpenAIClientProxy":
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> Any:
+        return await self._client.__aexit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+METRIC_SECTIONS = frozenset(
+    {
+        "loss",
+        "objective",
+        "offpolicy",
+        "pipeline",
+        "pipeline_settings",
+        "queue",
+        "sample_efficiency",
+        "throughput",
+        "costs",
+        "discarded",
+        "time",
+        "data",
+        "vllm",
+    }
+)
+METRIC_SPLITS = frozenset({"train", "val", "test"})
+
+WANDB_CANONICAL_METRIC_KEYS = frozenset(
+    {
+        "training_step",
+        SFT_WANDB_GRADIENT_STEP_KEY,
+        "objective/score",
+        "sample_efficiency/accepted_groups_per_step",
+        "sample_efficiency/batch_factor",
+        "sample_efficiency/freshness_discount",
+        "offpolicy/token_weighted_policy_age_steps",
+        "offpolicy/token_weighted_policy_age_p95_steps",
+        "throughput/accepted_train_tok_per_s",
+        "throughput/train_nonpadding_logical_tok_per_s",
+        "throughput/train_loss_bearing_tok_per_s",
+        "throughput/train_executed_tok_equiv_per_s",
+        "throughput/train_nominal_capacity_tok_per_s",
+        "data/step_trainable_assistant_tokens",
+        "data/step_nonpadding_logical_tokens",
+        "data/step_loss_bearing_tokens",
+        "data/step_executed_token_equivalents",
+        "data/step_nominal_schedule_capacity_tokens",
+        "data/step_dummy_executed_token_equivalents",
+        "data/step_dummy_schedule_capacity_tokens",
+        "data/step_unused_packed_capacity_tokens",
+        "data/step_unused_and_dummy_ratio",
+        "data/cum/num_unique_scenarios",
+        "data/cum/num_scenarios",
+        "data/cum/num_gradient_steps",
+        "discarded/cum/stale_groups",
+        "discarded/cum/zero_variance_groups",
+        "discarded/step/stale_groups",
+        "discarded/step/zero_variance_groups",
+        "discarded/rate/stale_groups",
+        "discarded/rate/zero_variance_groups",
+        "time/step_wall_s",
+        "time/cum/wall_s",
+        "time/step_collect_batch_s",
+        "time/step_backend_train_s",
+        "time/step_rollout_idle_s",
+        "pipeline_settings/num_rollout_workers",
+        "pipeline_settings/min_batch_size",
+        "pipeline_settings/max_batch_size",
+        "pipeline_settings/target_groups_per_step",
+        "pipeline_settings/queue_maxsize",
+        "queue/actual_stale_fraction",
+        "queue/put_wait_frac",
+        "queue/put_wait_s",
+        "loss/train",
+        "loss/entropy",
+        "loss/kl_div",
+        "loss/kl_policy_ref",
+        "loss/grad_norm",
+        "loss/learning_rate",
+        "loss/importance_ratio_mean",
+        "loss/importance_ratio_p95",
+        "loss/importance_ratio_p99",
+        "loss/clipped_token_fraction",
+        "vllm/prompt_tok_per_s",
+        "vllm/completion_tok_per_s",
+        "vllm/num_requests_running",
+        "vllm/num_requests_waiting",
+        "vllm/num_requests_waiting_capacity",
+        "vllm/prefix_cache_hit_rate",
+        "vllm/kv_cache_usage_perc",
+        *(
+            f"{split}/{metric}"
+            for split in METRIC_SPLITS
+            for metric in ("reward", "reward_std_dev", "exception_rate")
+        ),
+    }
+)
+WANDB_CANONICAL_METRIC_PREFIXES = (
+    "costs/cum/",
+    f"{SFT_METRIC_PREFIX}/",
+)
+
+
+def _wandb_run_is_finished(run: "Run") -> bool:
+    # W&B has changed private finished-state attrs across versions. Missing attrs
+    # mean the current run object should remain usable.
+    return bool(getattr(run, "_is_finished", getattr(run, "_finished", False)))
+
+
+class Model(
+    BaseModel,
+    Generic[ModelConfig, StateType],
+):
+    """
+    A model is an object that can be passed to your `rollout` function, and used
+    to log completions. Additionally, a `TrainableModel`, which is a subclass of
+    `Model`, can be used to train a model.
+
+    The `Model` abstraction is useful for comparing prompted model performance
+    to the performance of your trained models.
+
+    You can instantiate a prompted model like so:
+
+    ``python model = art.Model(
+        name="gpt-4.1", project="my-project",
+        inference_api_key=os.getenv("OPENAI_API_KEY"),
+        inference_base_url="https://api.openai.com/v1/",
+    )
+    ``
+
+    Or, if you're pointing at OpenRouter:
+
+    ``python model = art.Model(
+        name="gemini-2.5-pro", project="my-project",
+        inference_api_key=os.getenv("OPENROUTER_API_KEY"),
+        inference_base_url="https://openrouter.ai/api/v1",
+        inference_model_name="google/gemini-2.5-pro-preview-03-25",
+    )
+    ``
+
+    For trainable (`art.TrainableModel`) models the inference values will be
+    populated automatically by `model.register(api)` so you generally don't need
+    to think about them.
+    """
+
+    name: str
+    project: str
+    entity: str | None = None
+    id: str | None = None
+    run_id: str | None = None
+    config: ModelConfig
+    # Discriminator field for FastAPI serialization
+    trainable: bool = False
+
+    # --- Inference connection information (populated automatically for
+    #     TrainableModel or set manually for prompted / comparison models) ---
+    inference_api_key: str | None = None
+    inference_base_url: str | None = None
+    # If set, this will be used instead of `self.name` when calling the
+    # inference endpoint.
+    inference_model_name: str | None = None
+
+    # --- Frontend logging configuration ---
+    base_path: str = ".art"  # Same default as LocalBackend for backward compat
+    report_metrics: list[str] | None = None  # None = default (wandb if key present)
+
+    _backend: Optional["Backend"] = None
+    _s3_bucket: str | None = None
+    _s3_prefix: str | None = None
+    _openai_client: AsyncOpenAI | None = None
+    _art_binary_routes_base_url: str | None = None
+    _serving_capabilities: ServingCapabilities | None = None
+    _inference_connection_errors_are_fatal: bool = False
+    _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
+    _wandb_defined_metrics: set[str]
+    _wandb_config: dict[str, Any]
+    _run_start_time: float
+    _run_start_monotonic: float
+    _last_local_train_log_monotonic: float
+    _last_local_train_step: int | None
+    _metrics_builder: MetricsBuilder
+    _metrics_builder_state_loaded: bool
+    _cost_calculator: CostCalculator
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        project: str,
+        entity: str | None = None,
+        id: str | None = None,
+        config: ModelConfig | None = None,
+        inference_api_key: str | None = None,
+        inference_base_url: str | None = None,
+        inference_model_name: str | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
+        **kwargs: Never,
+    ) -> None:
+        BaseModel.__init__(
+            self,
+            name=name,
+            project=project,
+            entity=entity,
+            config=config,
+            inference_api_key=inference_api_key,
+            inference_base_url=inference_base_url,
+            inference_model_name=inference_model_name,
+            base_path=base_path,
+            report_metrics=report_metrics,
+            **kwargs,
+        )
+        self._init_runtime_state()
+
+    def _init_runtime_state(self) -> None:
+        object.__setattr__(self, "_wandb_defined_metrics", set())
+        object.__setattr__(self, "_wandb_config", {})
+        object.__setattr__(self, "_run_start_time", time.time())
+        object.__setattr__(self, "_run_start_monotonic", time.monotonic())
+        object.__setattr__(
+            self, "_last_local_train_log_monotonic", self._run_start_monotonic
+        )
+        object.__setattr__(self, "_last_local_train_step", None)
+        object.__setattr__(
+            self, "_metrics_builder", MetricsBuilder(cost_context="train")
+        )
+        object.__setattr__(self, "_metrics_builder_state_loaded", False)
+        object.__setattr__(self, "_art_binary_routes_base_url", None)
+        object.__setattr__(self, "_serving_capabilities", None)
+        object.__setattr__(self, "_inference_connection_errors_are_fatal", False)
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        project: str,
+        entity: str | None = None,
+        id: str | None = None,
+        config: None = None,
+        inference_api_key: str | None = None,
+        inference_base_url: str | None = None,
+        inference_model_name: str | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
+    ) -> "Model[None, dict[str, Any]]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        project: str,
+        entity: str | None = None,
+        id: str | None = None,
+        config: ModelConfig,
+        inference_api_key: str | None = None,
+        inference_base_url: str | None = None,
+        inference_model_name: str | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
+    ) -> "Model[ModelConfig, dict[str, Any]]": ...
+
+    def __new__(  # pyright: ignore[reportInconsistentOverload]
+        cls,
+        *args: Any,
+        **kwargs: Any,
+    ) -> "Model[Any, Any]":
+        return BaseModel.__new__(cls)
+
+    def safe_model_dump(self, *args, **kwargs) -> dict:
+        """
+        Dump the model, but remove the config field to prevent serialization errors in the backend.
+        """
+        data = super().model_dump(*args, **kwargs)
+        # remove config from dumped_model to prevent serialization errors
+        data["config"] = None
+        return data
+
+    def backend(self) -> "Backend":
+        if self._backend is None:
+            raise ValueError(
+                "Model is not registered with the Backend. You must call `model.register()` first."
+            )
+        return self._backend
+
+    async def register(self, backend: "Backend") -> None:
+        if self.config is not None:
+            try:
+                self.config.model_dump_json()  # ty:ignore[invalid-argument-type, possibly-missing-attribute]
+            except Exception as e:
+                raise ValueError(
+                    "The model config cannot be serialized to JSON. Please ensure that all fields are JSON serializable and try again."
+                ) from e
+
+        self._backend = backend
+        await self._backend.register(self)
+
+    def openai_client(
+        self,
+    ) -> AsyncOpenAI:
+        """Return ART's managed inference client.
+
+        For trainable models with configured pricing, chat completion calls made
+        through this client automatically emit Tinker inference costs when an
+        ART metrics context is active.
+        """
+        if self._openai_client is not None:
+            return self._openai_client
+
+        if self.inference_api_key is None or self.inference_base_url is None:
+            if self.trainable:
+                raise ValueError(
+                    "OpenAI client not yet available on this trainable model. You must call `model.register()` first."
+                )
+            else:
+                raise ValueError(
+                    "In order to create an OpenAI client you must provide an `inference_api_key` and `inference_base_url`."
+                )
+        raw_client = AsyncOpenAI(
+            base_url=self.inference_base_url,
+            api_key=self.inference_api_key,
+            http_client=DefaultAsyncHttpxClient(
+                timeout=type(DEFAULT_TIMEOUT)(timeout=1200, connect=5.0),
+                limits=type(DEFAULT_CONNECTION_LIMITS)(
+                    max_connections=100_000, max_keepalive_connections=100_000
+                ),
+            ),
+        )
+        # Wrap the raw OpenAI client so ART-owned inference calls can add
+        # split-scoped Tinker costs without rollout code needing to do it
+        # manually.
+        self._openai_client = cast(
+            AsyncOpenAI,
+            _OpenAIClientProxy(
+                raw_client,
+                self._record_openai_completion_costs,
+                self._default_chat_completion_extra_body(),
+                (
+                    self.inference_base_url
+                    if self._inference_connection_errors_are_fatal
+                    else None
+                ),
+                self._art_binary_routes_base_url,
+                self._policy_span_mode(),
+                self.trainable,
+            ),
+        )
+        return self._openai_client
+
+    async def _reset_inference_runtime(self) -> None:
+        client = self._openai_client
+        self._openai_client = None
+        self._art_binary_routes_base_url = None
+        self._serving_capabilities = None
+        self._inference_connection_errors_are_fatal = False
+        self.inference_base_url = None
+        self.inference_api_key = None
+        self.inference_model_name = None
+        if client is not None:
+            await client.close()
+
+    def _policy_span_mode(self) -> Literal["none", "require", "synthesize"]:
+        internal_config = getattr(self, "_internal_config", None)
+        if not self.trainable or self._serving_capabilities is None:
+            return "none"
+        if self._serving_capabilities.policy_token_spans:
+            return "require"
+        if (internal_config or {}).get(
+            "rollout_weight_update_mode", "step_lora"
+        ) == "step_lora":
+            return "synthesize"
+        return "none"
+
+    def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
+        """Defaults for ART-managed inference while preserving caller overrides."""
+        internal_config = getattr(self, "_internal_config", None)
+        if internal_config is None and not self.trainable:
+            return None
+        body: dict[str, Any] = {}
+        if self.trainable:
+            body["return_token_ids"] = True
+            body["return_tokens_as_token_ids"] = True
+        configured_chat_template_kwargs = (
+            internal_config.get("chat_template_kwargs")
+            if internal_config is not None
+            else None
+        )
+        if self.trainable or internal_config is not None:
+            body["chat_template_kwargs"] = {
+                "preserve_thinking": True,
+                **(configured_chat_template_kwargs or {}),
+            }
+        if not body:
+            return None
+        return body
+
+    def litellm_completion_params(self, step: int | None = None) -> dict:
+        """Return the parameters that should be sent to litellm.completion.
+
+        Args:
+            step: If provided, returns params for specific checkpoint using
+                  the `name@step` convention. If None, returns params for
+                  latest checkpoint (default, backwards compatible).
+        """
+        model_name = self.get_inference_name(step)
+        if self.trainable:
+            model_name = f"hosted_vllm/{model_name}"
+        params = {
+            "model": model_name,
+            "base_url": self.inference_base_url,
+            "api_key": self.inference_api_key,
+            "temperature": 1,  # Important for trainable models
+        }
+        if extra_body := self._default_chat_completion_extra_body():
+            params["extra_body"] = extra_body
+        return params
+
+    # ------------------------------------------------------------------
+    # Inference name helpers
+    # ------------------------------------------------------------------
+
+    def get_inference_name(self, step: int | None = None) -> str:
+        """Return the name that should be sent to the inference endpoint.
+
+        Args:
+            step: If provided, returns name for specific checkpoint.
+                  If None, returns name for latest/default checkpoint.
+
+        Note:
+            For TrainableModel with LocalBackend, vLLM serves LoRA adapters
+            as `model.name@step`, so this always includes the step suffix.
+            For ServerlessBackend, it uses W&B artifact naming conventions.
+        """
+        # If we have a registered backend with _model_inference_name, use it
+        # This ensures proper step handling for each backend type
+        if self._backend is not None and hasattr(
+            self._backend, "_model_inference_name"
+        ):
+            return self._backend._model_inference_name(self, step=step)
+
+        # Fallback for non-registered models or backends without the method
+        base_name = self.inference_model_name or self.name
+        if step is not None:
+            return f"{base_name}@{step}"
+        return base_name
+
+    def _record_openai_completion_costs(self, _response: Any) -> None:
+        """Hook for subclasses that want to auto-log managed inference costs."""
+        return
+
+    def _get_output_dir(self) -> str:
+        """Get the output directory for this model."""
+        return f"{self.base_path}/{self.project}/models/{self._storage_name()}"
+
+    def _storage_name(self) -> str:
+        return self.name
+
+    def overwrite_state(self, state: StateType) -> None:
+        """Overwrite persistent state in the model directory as JSON.
+
+        This state is stored in `state.json` within the model's output directory
+        and can be used to track training progress, dataset position, or any
+        other information that should persist across runs.
+
+        Warning:
+            This overwrites the entire state file. Prefer `merge_state()` unless
+            you intentionally want to replace all existing keys.
+
+        Args:
+            state: A dictionary of JSON-serializable values to persist.
+
+        Example:
+            model.overwrite_state({
+                "step": 5,
+                "dataset_offset": 100,
+                "last_checkpoint_time": "2024-01-15T10:30:00",
+            })
+        """
+        output_dir = self._get_output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        with open(f"{output_dir}/state.json", "w") as f:
+            json.dump(state, f, indent=2)
+
+    def write_state(self, state: StateType) -> None:
+        """Deprecated: use `overwrite_state()` or `merge_state()` instead."""
+        warnings.warn(
+            "write_state() is deprecated. Use overwrite_state() or merge_state() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.overwrite_state(state)
+
+    def merge_state(self, state: dict[str, Any]) -> StateType:
+        """Deep-merge state into the existing state and persist it.
+
+        Args:
+            state: A dictionary of JSON-serializable values to merge.
+
+        Returns:
+            The merged state dictionary that was persisted.
+        """
+        existing = self.read_state() or {}
+        merged = self._deep_merge_dicts(existing, state)
+        self.overwrite_state(merged)
+        return cast(StateType, merged)
+
+    @staticmethod
+    def _deep_merge_dicts(
+        base: dict[str, Any], updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        merged = dict(base)
+        for key, value in updates.items():
+            if (
+                key in merged
+                and isinstance(merged[key], dict)
+                and isinstance(value, dict)
+            ):
+                merged[key] = Model._deep_merge_dicts(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _merge_wandb_config(
+        existing: dict[str, Any],
+        updates: dict[str, Any],
+        *,
+        path: str = "",
+    ) -> dict[str, Any]:
+        merged = dict(existing)
+        for key, value in updates.items():
+            key_path = f"{path}.{key}" if path else key
+            if key not in merged:
+                merged[key] = value
+                continue
+            existing_value = merged[key]
+            if isinstance(existing_value, dict) and isinstance(value, dict):
+                merged[key] = Model._merge_wandb_config(
+                    existing_value,
+                    value,
+                    path=key_path,
+                )
+                continue
+            if existing_value != value:
+                raise ValueError(
+                    "W&B config is immutable once set. "
+                    f"Conflicting value for '{key_path}'."
+                )
+        return merged
+
+    def read_state(self) -> StateType | None:
+        """Read persistent state from the model directory.
+
+        Returns:
+            The state dictionary if it exists, or None if no state has been saved.
+
+        Example:
+            state = model.read_state()
+            if state:
+                start_step = state["step"]
+                dataset_offset = state["dataset_offset"]
+        """
+        output_dir = self._get_output_dir()
+        state_path = f"{output_dir}/state.json"
+        if not os.path.exists(state_path):
+            return None
+        with open(state_path, "r") as f:
+            return json.load(f)
+
+    def update_wandb_config(
+        self,
+        config: dict[str, Any],
+    ) -> None:
+        """Merge configuration into the W&B run config for this model.
+
+        This can be called before the W&B run exists, in which case the config is
+        passed to `wandb.init(...)` when ART first creates the run. If the run is
+        already active, ART updates the run config immediately.
+
+        Args:
+            config: JSON-serializable configuration to store on the W&B run.
+        """
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dict[str, Any]")
+
+        merged = self._merge_wandb_config(self._wandb_config, config)
+        object.__setattr__(self, "_wandb_config", merged)
+
+        if self._wandb_run is not None and not _wandb_run_is_finished(self._wandb_run):
+            self._sync_wandb_config(self._wandb_run)
+
+    def _sync_wandb_config(
+        self,
+        run: "Run",
+    ) -> None:
+        if not self._wandb_config:
+            return
+
+        run_config = getattr(run, "config", None)
+        if run_config is None or not hasattr(run_config, "update"):
+            return
+
+        run_config.update(
+            self._wandb_config,
+        )
+
+    def _get_wandb_run(self) -> Optional["Run"]:
+        """Get or create the wandb run for this model."""
+        if "WANDB_API_KEY" not in os.environ:
+            return None
+        if self._wandb_run is None or _wandb_run_is_finished(self._wandb_run):
+            try:
+                run = wandb_sdk.init(
+                    project=self.project,
+                    name=self._storage_name(),
+                    id=self._storage_name(),
+                    config=self._wandb_config or None,
+                    resume="allow",
+                    reinit="create_new",
+                    settings=wandb_sdk.settings(
+                        x_stats_open_metrics_endpoints={
+                            "vllm": "http://localhost:8000/metrics",
+                        },
+                        x_stats_open_metrics_filters=(
+                            "vllm.vllm:num_requests_waiting",
+                            "vllm.vllm:num_requests_running",
+                        ),
+                    ),
+                )
+            except ModuleNotFoundError as e:
+                if e.name == "wandb" or (e.name or "").startswith("wandb."):
+                    return None
+                raise
+            self._wandb_run = run
+            object.__setattr__(
+                self,
+                "_wandb_defined_metrics",
+                {
+                    SFT_WANDB_GRADIENT_STEP_KEY,
+                    "training_step",
+                },
+            )
+
+            # Define training_step as the x-axis for all metrics.
+            # This allows out-of-order logging (e.g., async validation for previous steps).
+            run.define_metric("training_step")
+            run.define_metric(SFT_WANDB_GRADIENT_STEP_KEY)
+            for split in ("train", "val", "test"):
+                run.define_metric(f"{split}/*", step_metric="training_step")
+            run.define_metric("loss/*", step_metric="training_step")
+            run.define_metric("objective/*", step_metric="training_step")
+            run.define_metric("sample_efficiency/*", step_metric="training_step")
+            run.define_metric("offpolicy/*", step_metric="training_step")
+            run.define_metric("throughput/*", step_metric="training_step")
+            run.define_metric("costs/*", step_metric="training_step")
+            run.define_metric("time/*", step_metric="training_step")
+            run.define_metric("data/*", step_metric="training_step")
+            run.define_metric("discarded/*", step_metric="training_step")
+            run.define_metric("pipeline_settings/*", step_metric="training_step")
+            run.define_metric("vllm/*", step_metric="training_step")
+            run.define_metric(
+                f"{SFT_METRIC_PREFIX}/*", step_metric=SFT_WANDB_GRADIENT_STEP_KEY
+            )
+            self._sync_wandb_config(run)
+        return self._wandb_run
+
+    def _log_metrics(
+        self,
+        metrics: dict[str, float],
+        split: str,
+        step: int,
+        *,
+        custom_metric_keys: set[str] | None = None,
+    ) -> None:
+        """Log metrics to history.jsonl and optionally wandb."""
+        prefixed = {
+            self._qualify_metric_key(key, split): value
+            for key, value in metrics.items()
+        }
+        qualified_custom_keys = {
+            self._qualify_metric_key(key, split) for key in custom_metric_keys or set()
+        }
+
+        prefixed["training_step"] = step
+
+        output_dir = self._get_output_dir()
+
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Write to history.jsonl
+        with open(f"{output_dir}/history.jsonl", "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        k: v for k, v in prefixed.items() if v == v
+                    }  # Filter out NaN values
+                    | {"step": step, "recorded_at": datetime.now().isoformat()}
+                )
+                + "\n"
+            )
+
+        # Log to wandb if enabled
+        should_log_wandb = (
+            self.report_metrics is None and "WANDB_API_KEY" in os.environ
+        ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
+        if should_log_wandb:
+            if run := self._get_wandb_run():
+                wandb_metrics = self._wandb_metrics_payload(
+                    prefixed, qualified_custom_keys
+                )
+                self._define_wandb_step_metrics(
+                    wandb_metrics.keys(), qualified_custom_keys
+                )
+                # Let W&B use its own monotonically increasing history step.
+                # ART's `training_step` remains the x-axis via define_metric,
+                # which preserves out-of-order eval logging.
+                run.log(wandb_metrics)
+
+    @staticmethod
+    def _qualify_metric_key(key: str, split: str) -> str:
+        first_component = key.split("/", 1)[0]
+        if split == SFT_METRIC_PREFIX:
+            return key if first_component == SFT_METRIC_PREFIX else f"{split}/{key}"
+        if "/" in key and (
+            first_component in METRIC_SECTIONS or first_component in METRIC_SPLITS
+        ):
+            return key
+        return f"{split}/{key}"
+
+    @staticmethod
+    def _direct_custom_metric_keys(metrics: dict[str, float], split: str) -> set[str]:
+        return set(metrics)
+
+    def _wandb_metrics_payload(
+        self,
+        metrics: dict[str, float],
+        custom_metric_keys: set[str] | None = None,
+    ) -> dict[str, float]:
+        custom_metric_keys = custom_metric_keys or set()
+        return {
+            key: value
+            for key, value in metrics.items()
+            if key in WANDB_CANONICAL_METRIC_KEYS
+            or key.startswith(WANDB_CANONICAL_METRIC_PREFIXES)
+            or key in custom_metric_keys
+        }
+
+    def _define_wandb_step_metrics(
+        self, keys: Iterable[str], custom_metric_keys: set[str]
+    ) -> None:
+        run = self._wandb_run
+        if run is None or _wandb_run_is_finished(run):
+            return
+
+        for key in keys:
+            if not key.startswith("costs/") and key not in custom_metric_keys:
+                continue
+            if key in self._wandb_defined_metrics:
+                continue
+            run.define_metric(key, step_metric="training_step")
+            self._wandb_defined_metrics.add(key)
+
+    def _route_metrics_and_collect_non_costs(
+        self, metrics: dict[str, float], split: str
+    ) -> dict[str, float]:
+        builder = self._metrics_builder_for_split(split)
+        non_cost_metrics: dict[str, float] = {}
+        for metric, value in metrics.items():
+            numeric_value = float(value)
+            if metric.startswith("costs/"):
+                builder.add_cost(metric[len("costs/") :], numeric_value)
+                continue
+            if metric.startswith("costs_"):
+                raise ValueError(
+                    "Legacy cost keys like 'costs_prefill' are no longer supported. "
+                    "Log explicit cost keys like 'costs/train/tinker_prefill' or "
+                    "'costs/eval/judge/ruler' instead."
+                )
+            if is_builder_managed_metric(metric):
+                builder.add_metric(metric, numeric_value)
+                continue
+            non_cost_metrics[metric] = numeric_value
+        return non_cost_metrics
+
+    def _route_split_metrics_and_collect_non_costs(
+        self,
+        metrics: dict[str, float],
+        split: str,
+        *,
+        prefix: str | None = None,
+    ) -> dict[str, float]:
+        routed = self._route_metrics_and_collect_non_costs(metrics, split)
+        split_prefix = split
+        if prefix:
+            split_prefix = f"{split_prefix}/{prefix.strip('/')}"
+        return {f"{split_prefix}/{metric}": value for metric, value in routed.items()}
+
+    def _collect_automatic_backend_metrics(
+        self,
+        *,
+        split: str,
+        step: int,
+        provided_metric_keys: set[str],
+    ) -> dict[str, float]:
+        if split != "train" or self._backend is None:
+            return {}
+
+        supports_step_metrics = getattr(
+            self._backend, "supports_automatic_train_step_metrics", None
+        )
+        if not callable(supports_step_metrics) or not supports_step_metrics():
+            return {}
+
+        if self._last_local_train_step == step:
+            return {}
+
+        now = time.monotonic()
+        step_wall_s = max(0.0, now - self._last_local_train_log_monotonic)
+        object.__setattr__(self, "_last_local_train_log_monotonic", now)
+        object.__setattr__(self, "_last_local_train_step", step)
+
+        automatic_metrics: dict[str, float] = {}
+        if "time/step_wall_s" not in provided_metric_keys:
+            automatic_metrics["time/step_wall_s"] = step_wall_s
+
+        gpu_cost_getter = getattr(
+            self._backend, "automatic_gpu_cost_per_hour_usd", None
+        )
+        if callable(gpu_cost_getter) and "costs/gpu" not in provided_metric_keys:
+            gpu_cost_per_hour_usd = gpu_cost_getter(self)
+            if isinstance(gpu_cost_per_hour_usd, int | float):
+                automatic_metrics["costs/gpu"] = (
+                    step_wall_s * float(gpu_cost_per_hour_usd) / 3600.0
+                )
+
+        return automatic_metrics
+
+    def _add_default_step_metrics(
+        self,
+        trajectory_groups: list[TrajectoryGroup],
+        *,
+        split: str,
+        provided_metric_keys: set[str],
+    ) -> dict[str, float]:
+        if split not in METRIC_SPLITS:
+            return {}
+
+        summary = summarize_trajectory_groups(trajectory_groups)
+        default_data_metrics = build_data_metrics_from_summary(
+            summary,
+            include_trainable_groups=split == "train",
+        )
+        missing_metrics = {
+            key: value
+            for key, value in default_data_metrics.items()
+            if key not in provided_metric_keys
+            and f"{split}/{key}" not in provided_metric_keys
+        }
+        if split != "train":
+            return {f"{split}/{key}": value for key, value in missing_metrics.items()}
+
+        builder = self._metrics_builder_for_split(split)
+        for key, value in missing_metrics.items():
+            builder.add_metric(key, value)
+
+        if summary.scenario_ids:
+            builder.add_data(scenario_ids=summary.scenario_ids)
+
+        return {}
+
+    def metrics_builder(self, cost_context: str | None = None) -> MetricsBuilder:
+        self._load_metrics_builder_state()
+        if cost_context is None:
+            return self._metrics_builder
+        return self._metrics_builder.for_cost_context(cost_context)
+
+    def activate_metrics_context(self, cost_context: str) -> Token[MetricsBuilder]:
+        return self.metrics_builder(cost_context).activate()
+
+    def _metrics_builder_for_split(self, split: str) -> MetricsBuilder:
+        if split == "train":
+            return self._metrics_builder.for_cost_context("train", buffer_scope="train")
+        if split in {"val", "test"}:
+            return self._metrics_builder.for_cost_context("eval", buffer_scope="eval")
+        return self._metrics_builder.for_cost_context(split, buffer_scope=split)
+
+    def _load_metrics_builder_state(self) -> None:
+        if self._metrics_builder_state_loaded:
+            return
+        state = self.read_state() or {}
+        metrics_state = state.get(METRICS_BUILDER_STATE_KEY)
+        if isinstance(metrics_state, dict):
+            self._metrics_builder.load_state_dict(metrics_state)
+        object.__setattr__(self, "_metrics_builder_state_loaded", True)
+
+    def _persist_metrics_builder_state(self) -> None:
+        self.merge_state(
+            {METRICS_BUILDER_STATE_KEY: self._metrics_builder.state_dict()}
+        )
+
+    def _normalize_trajectory_groups(
+        self,
+        trajectories: Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup],
+    ) -> list[TrajectoryGroup]:
+        items = list(trajectories)
+        if not items:
+            return []
+
+        if all(isinstance(item, TrajectoryGroup) for item in items):
+            return cast(list[TrajectoryGroup], items)
+
+        if all(isinstance(item, (Trajectory, BaseException)) for item in items):
+            return [TrajectoryGroup(cast(Iterable[Trajectory | BaseException], items))]
+
+        raise TypeError(
+            "trajectories must be an iterable of TrajectoryGroup objects or "
+            "an iterable of Trajectory/BaseException items"
+        )
+
+    async def log(
+        self,
+        trajectories: (
+            Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup] | None
+        ) = None,
+        split: str = "val",
+        *,
+        metrics: dict[str, float] | None = None,
+        step: int | None = None,
+    ) -> None:
+        """
+        Log trajectories and/or metrics.
+
+        Can be used in two ways:
+        1. Log trajectories: `await model.log(trajectory_groups, split="train")`
+        2. Log raw metrics: `await model.log(metrics={"loss": 0.5}, step=1)`
+        3. Both: `await model.log(trajectory_groups, metrics=extra_metrics)`
+
+        Args:
+            trajectories: A batch of trajectories or trajectory groups. Optional if
+                logging only metrics.
+            split: The evaluation's split. Defaults to "val".
+            metrics: Optional dict of metrics to log directly (e.g., training metrics
+                from backend.train()).
+            step: Optional step number for metrics. If not provided, uses current step.
+        """
+        # Determine the step to use
+        if step is None:
+            step = await self.get_step() if self.trainable else 0
+
+        self._load_metrics_builder_state()
+        builder = self._metrics_builder_for_split(split)
+
+        # If only metrics provided (no trajectories), just log them and return
+        if trajectories is None:
+            if metrics is not None:
+                provided_metric_keys = set(metrics)
+                automatic_metrics = self._collect_automatic_backend_metrics(
+                    split=split,
+                    step=step,
+                    provided_metric_keys=provided_metric_keys,
+                )
+                if automatic_metrics:
+                    self._route_metrics_and_collect_non_costs(automatic_metrics, split)
+                metrics_without_costs = self._route_metrics_and_collect_non_costs(
+                    metrics, split
+                )
+                builder_metrics = await builder.flush()
+                merged_metrics = {**metrics_without_costs, **builder_metrics}
+                if merged_metrics:
+                    self._log_metrics(
+                        merged_metrics,
+                        split,
+                        step,
+                        custom_metric_keys=self._direct_custom_metric_keys(
+                            metrics_without_costs, split
+                        ),
+                    )
+                self._persist_metrics_builder_state()
+            return
+
+        trajectory_groups = self._normalize_trajectory_groups(trajectories)
+        provided_metric_keys = set(metrics or {})
+
+        automatic_metrics = self._collect_automatic_backend_metrics(
+            split=split,
+            step=step,
+            provided_metric_keys=provided_metric_keys,
+        )
+        if automatic_metrics:
+            self._route_metrics_and_collect_non_costs(automatic_metrics, split)
+
+        default_train_metrics = self._add_default_step_metrics(
+            trajectory_groups,
+            split=split,
+            provided_metric_keys=provided_metric_keys,
+        )
+
+        # Ensure output directories exist
+        output_dir = self._get_output_dir()
+        trajectories_dir = f"{output_dir}/trajectories/{split}"
+        os.makedirs(trajectories_dir, exist_ok=True)
+
+        # 1. Write parquet
+        file_name = f"{step:04d}.parquet"
+        trajectory_path = f"{trajectories_dir}/{file_name}"
+        prepared_paths = {
+            group._prepared_log_path
+            for group in trajectory_groups
+            if group._prepared_log_path is not None
+        }
+        if prepared_paths:
+            if len(prepared_paths) != 1 or any(
+                group._prepared_log_path is None for group in trajectory_groups
+            ):
+                raise RuntimeError("trajectory batch has inconsistent prepared logs")
+            os.replace(prepared_paths.pop(), trajectory_path)
+            for group in trajectory_groups:
+                group._prepared_log_path = None
+        else:
+            write_trajectory_groups_parquet(trajectory_groups, trajectory_path)
+
+        # 2. Calculate aggregate metrics (excluding additive costs)
+        reward_key = "reward"
+        exception_rate_key = "exception_rate"
+        reward_std_dev_key = "reward_std_dev"
+
+        all_metrics: dict[str, list[float]] = {
+            reward_key: [],
+            exception_rate_key: [],
+        }
+        group_metrics: dict[str, list[float]] = {}
+        custom_metric_keys: set[str] = set()
+
+        for group in trajectory_groups:
+            if group.metrics:
+                group_non_cost = self._route_split_metrics_and_collect_non_costs(
+                    cast(dict[str, float], group.metrics),
+                    split,
+                    prefix="group",
+                )
+            else:
+                group_non_cost = {}
+            custom_metric_keys.update(group_non_cost)
+            if group.trajectories:
+                for metric, value in group_non_cost.items():
+                    if metric not in group_metrics:
+                        group_metrics[metric] = []
+                    group_metrics[metric].append(float(value))
+
+            all_metrics[exception_rate_key].extend(0.0 for _ in group.trajectories)
+            all_metrics[exception_rate_key].extend(1.0 for _ in group.exceptions)
+
+            for trajectory in group.trajectories:
+                all_metrics[reward_key].append(trajectory.reward)
+
+                # Collect other custom metrics
+                trajectory_metrics: dict[str, float] = {}
+                for metric, value in trajectory.metrics.items():
+                    trajectory_metrics[metric] = float(value)
+
+                non_cost_trajectory_metrics = (
+                    self._route_split_metrics_and_collect_non_costs(
+                        trajectory_metrics,
+                        split,
+                    )
+                )
+                custom_metric_keys.update(non_cost_trajectory_metrics)
+                for metric, value in non_cost_trajectory_metrics.items():
+                    if metric not in all_metrics:
+                        all_metrics[metric] = []
+                    all_metrics[metric].append(float(value))
+
+        # Calculate averages for all metrics
+        averages: dict[str, float] = {}
+        for metric, values in all_metrics.items():
+            if len(values) > 0:
+                averages[metric] = sum(values) / len(values)
+
+        averages.update(default_train_metrics)
+
+        # Aggregate group-level metrics once per group
+        for metric, values in group_metrics.items():
+            if len(values) > 0:
+                averages[metric] = sum(values) / len(values)
+
+        # Calculate average standard deviation of rewards within groups
+        from .utils.old_benchmarking.calculate_step_metrics import (
+            calculate_step_std_dev,
+        )
+
+        averages[reward_std_dev_key] = calculate_step_std_dev(trajectory_groups)
+
+        reward_value = averages.pop(reward_key, None)
+        reward_std_dev = averages.pop(reward_std_dev_key, None)
+        exception_rate = averages.pop(exception_rate_key, None)
+        if reward_value is not None:
+            averages[f"{split}/reward"] = reward_value
+        if reward_std_dev is not None:
+            averages[f"{split}/reward_std_dev"] = reward_std_dev
+        if exception_rate is not None:
+            averages[f"{split}/exception_rate"] = exception_rate
+
+        # Merge in any additional metrics passed directly
+        if metrics is not None:
+            metrics_without_costs = self._route_metrics_and_collect_non_costs(
+                metrics, split
+            )
+            averages.update(metrics_without_costs)
+            custom_metric_keys.update(
+                self._direct_custom_metric_keys(metrics_without_costs, split)
+            )
+
+        # 3. Merge in any builder-managed metrics and log a single row.
+        builder_metrics = await builder.flush()
+        merged_metrics = {**averages, **builder_metrics}
+        if merged_metrics:
+            self._log_metrics(
+                merged_metrics,
+                split,
+                step,
+                custom_metric_keys=custom_metric_keys,
+            )
+        self._persist_metrics_builder_state()
+
+    async def get_step(self) -> int:
+        """
+        Get the model's current training step. For non-trainable models, returns 0.
+        """
+        if self.trainable:
+            return await self.backend()._get_step(self)  # type: ignore
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Trainable models
+# ---------------------------------------------------------------------------
+
+
+class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateType]):
+    base_model: str
+    # Durable checkpoint/W&B lineage; `name` remains the inference-serving alias.
+    run_name: str
+    lora_config: dev.LoRAConfig | None = None
+    # Override discriminator field for FastAPI serialization
+    trainable: bool = True
+
+    # The fields within `_internal_config` are unstable and subject to change.
+    # Use at your own risk.
+    _internal_config: dev.InternalModelConfig | None = None
+
+    def _storage_name(self) -> str:
+        return self.run_name
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        run_name: str,
+        project: str,
+        entity: str | None = None,
+        id: str | None = None,
+        run_id: str | None = None,
+        config: ModelConfig | None = None,
+        base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
+        _internal_config: dev.InternalModelConfig | None = None,
+        **kwargs: Never,
+    ) -> None:
+        BaseModel.__init__(
+            self,
+            name=name,
+            run_name=run_name,
+            project=project,
+            entity=entity,
+            id=id,
+            config=config,
+            base_model=base_model,
+            lora_config=lora_config,
+            base_path=base_path,
+            report_metrics=report_metrics,
+            **kwargs,
+        )
+        self._init_runtime_state()
+        object.__setattr__(self, "_cost_calculator", self._noop_cost_calculator)
+        if _internal_config is not None:
+            # Bypass BaseModel __setattr__ to allow setting private attr
+            object.__setattr__(self, "_internal_config", _internal_config)
+
+    @property
+    def cost_calculator(self) -> CostCalculator:
+        return self._cost_calculator
+
+    def set_cost_calculator(self, calculator: CostCalculator | None) -> None:
+        object.__setattr__(
+            self,
+            "_cost_calculator",
+            calculator if calculator is not None else self._noop_cost_calculator,
+        )
+
+    @staticmethod
+    def _noop_cost_calculator(
+        _prompt_tokens: int | None,
+        _completion_tokens: int | None,
+        _cost_context: str,
+    ) -> dict[str, float]:
+        return {}
+
+    def _record_openai_completion_costs(self, _response: Any) -> None:
+        try:
+            builder = MetricsBuilder.get_active()
+        except LookupError:
+            return
+
+        usage = getattr(_response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        num_choices = len(getattr(_response, "choices", None) or [])
+        effective_prompt_tokens = prompt_tokens * max(num_choices, 1)
+        cost_context = builder.cost_context.strip("/")
+        if not cost_context:
+            return
+
+        cost_metrics = self._cost_calculator(
+            effective_prompt_tokens,
+            completion_tokens,
+            cost_context,
+        )
+        if not cost_metrics:
+            return
+
+        for key, value in cost_metrics.items():
+            if not key.startswith("costs/"):
+                continue
+            builder.add_cost(key[len("costs/") :], float(value))
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        run_name: str,
+        project: str,
+        entity: str | None = None,
+        id: str | None = None,
+        config: None = None,
+        base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
+        _internal_config: dev.InternalModelConfig | None = None,
+    ) -> "TrainableModel[None, dict[str, Any]]": ...
+
+    @overload
+    def __new__(
+        cls,
+        *,
+        name: str,
+        run_name: str,
+        project: str,
+        entity: str | None = None,
+        id: str | None = None,
+        config: ModelConfig,
+        base_model: str,
+        lora_config: dev.LoRAConfig | None = None,
+        base_path: str = ".art",
+        report_metrics: list[str] | None = None,
+        _internal_config: dev.InternalModelConfig | None = None,
+    ) -> "TrainableModel[ModelConfig, dict[str, Any]]": ...
+
+    def __new__(  # pyright: ignore[reportInconsistentOverload]
+        cls,
+        *args: Any,
+        **kwargs: Any,
+    ) -> "TrainableModel[Any, Any]":
+        return BaseModel.__new__(cls)
+
+    def model_dump(self, *args, **kwargs) -> dict:
+        data = super().model_dump(*args, **kwargs)
+        data["_internal_config"] = self._internal_config
+        return data
+
+    def safe_model_dump(self, *args, **kwargs) -> dict:
+        """
+        Dump the model, but remove the config field to prevent serialization errors in the backend.
+        """
+        data = self.model_dump(*args, **kwargs)
+        # remove config from dumped_model to prevent serialization errors
+        data["config"] = None
+        return data
+
+    async def register(
+        self,
+        backend: "Backend",
+        _openai_client_config: dev.OpenAIServerConfig | None = None,
+    ) -> None:
+        await self._reset_inference_runtime()
+        await super().register(backend)
+        base_url, api_key = await backend._prepare_backend_for_training(
+            self, _openai_client_config
+        )
+
+        # Populate the top-level inference fields so that the rest of the
+        # code (and any user code) can create an OpenAI client immediately.
+        self.inference_base_url = base_url
+        self.inference_api_key = api_key
+        self.inference_model_name = (
+            hasattr(backend, "_model_inference_name")
+            and getattr(backend, "_model_inference_name")(self)
+            or self.name
+        )
+
+    async def delete_checkpoints(
+        self, best_checkpoint_metric: str = "val/reward"
+    ) -> None:
+        """
+        Delete all but the latest and best checkpoints.
+
+        Args:
+            best_checkpoint_metric: The metric to use to determine the best checkpoint.
+                Defaults to "val/reward".
+        """
+        output_dir = self._get_output_dir()
+        steps_to_keep = [await self.get_step()]  # Keep latest
+
+        # Read history.jsonl to find best step
+        try:
+            best_step = (
+                pl.read_ndjson(f"{output_dir}/history.jsonl")
+                .drop_nulls(subset=[best_checkpoint_metric])
+                .group_by("step")
+                .mean()
+                .sort(best_checkpoint_metric)
+                .select(pl.col("step").last())
+                .item()
+            )
+            steps_to_keep.append(best_step)
+        except FileNotFoundError:
+            print(f'"{output_dir}/history.jsonl" not found')
+        except pl.exceptions.ColumnNotFoundError:
+            print(f'No "{best_checkpoint_metric}" metric found in history')
+
+        # Backend only does file deletion
+        await self.backend()._delete_checkpoint_files(self, steps_to_keep)
+
+    async def train_sft(
+        self,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig | None = None,
+        _config: dev.TrainSFTConfig | None = None,
+        verbose: bool = False,
+        log_metrics: bool = True,
+    ) -> None:
+        """
+        Supervised fine-tune the model with an iterable of trajectories.
+
+        Args:
+            trajectories: An iterable of Trajectory objects.
+            config: SFT configuration including learning_rate, batch_size, and which
+                assistant turns contribute loss. If None, uses TrainSFTConfig().
+            _config: Additional experimental configuration that is subject to change and
+                not yet part of the public API. Use at your own risk.
+            verbose: Whether to print verbose output.
+            log_metrics: Whether to log SFT optimizer metrics. Defaults to True.
+        """
+        if config is None:
+            config = TrainSFTConfig()
+
+        backend = self.backend()
+        backend_logs_sft_metrics = (
+            log_metrics and self._backend_logs_sft_metrics_remotely(backend)
+        )
+
+        _config = cast(dev.TrainSFTConfig, {**(_config or {})})
+        if log_metrics:
+            metric_logging_config: SFTMetricLoggingConfig = {
+                "enabled": True,
+            }
+            if backend_logs_sft_metrics:
+                metric_logging_config["target_training_step"] = (
+                    await self.get_step()
+                ) + 1
+            _config["metric_logging"] = metric_logging_config
+        else:
+            _config["metric_logging"] = {"enabled": False}
+
+        # Train (backend yields metrics for each batch without logging)
+        # Collect all metrics and aggregate them at the end for the checkpoint summary.
+        training_metrics: list[dict[str, float]] = []
+        local_sft_checkpoint_step: int | None = None
+        trainer_started = time.monotonic()
+        async for metrics in backend._train_sft(
+            self,
+            trajectories,
+            config,
+            _config,  # ty:ignore[invalid-argument-type]
+            verbose,
+        ):
+            training_metrics.append(metrics)
+            gradient_step = len(training_metrics)
+            if log_metrics and not backend_logs_sft_metrics:
+                if local_sft_checkpoint_step is None:
+                    local_sft_checkpoint_step = await self.get_step() + 1
+                await self._log_sft_metric_sample(
+                    metrics,
+                    checkpoint_step=local_sft_checkpoint_step,
+                    gradient_step=gradient_step,
+                )
+        trainer_elapsed = time.monotonic() - trainer_started
+
+        # Log aggregated training metrics once at the checkpoint step. For
+        # remote-logging backends, the remote SFT job owns this row too.
+        if training_metrics and log_metrics and not backend_logs_sft_metrics:
+            avg_metrics = average_metric_samples(training_metrics)
+            avg_metrics["time/step_backend_train_s"] = trainer_elapsed
+            # Get the current step after training
+            step = await self.get_step()
+            await self.log(
+                trajectories=None, split="train", metrics=avg_metrics, step=step
+            )
+
+    @staticmethod
+    def _backend_logs_sft_metrics_remotely(backend: "Backend") -> bool:
+        remote_logger = getattr(type(backend), "logs_sft_metrics_remotely", None)
+        if not callable(remote_logger):
+            return False
+        return bool(remote_logger(backend))
+
+    async def _log_sft_metric_sample(
+        self,
+        metrics: dict[str, float],
+        *,
+        checkpoint_step: int,
+        gradient_step: int,
+    ) -> None:
+        await self.log(
+            trajectories=None,
+            split=SFT_METRIC_PREFIX,
+            metrics={
+                SFT_GRADIENT_STEP_KEY: float(gradient_step),
+                **metrics,
+            },
+            step=checkpoint_step,
+        )

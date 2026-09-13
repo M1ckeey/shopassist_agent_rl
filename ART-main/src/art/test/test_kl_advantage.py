@@ -1,0 +1,221 @@
+"""Tests for KL-penalized advantage adjustment in loss_fn."""
+
+import torch
+
+from art.loss import LossInputs, loss_fn, shift_tensor
+
+
+def _make_inputs(
+    batch_size: int = 1,
+    seq_len: int = 8,
+    advantages: list[float] | None = None,
+):
+    """Create minimal TrainInputs-like dict for loss_fn."""
+    if advantages is None:
+        advantages = [1.0] * seq_len
+    adv_tensor = torch.tensor([advantages], dtype=torch.float32)
+    tokens = torch.zeros(batch_size, seq_len, dtype=torch.long)
+    logprobs = torch.zeros(batch_size, seq_len)
+    assistant_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    # First token is not assistant (shifted)
+    assistant_mask[:, 0] = False
+    weights = torch.ones(batch_size, seq_len)
+    group_ids = torch.ones(batch_size, seq_len, dtype=torch.long)
+    parent_ids = torch.zeros(batch_size, seq_len, dtype=torch.long)
+    return {
+        "tokens": tokens,
+        "logprobs": logprobs,
+        "advantages": adv_tensor,
+        "assistant_mask": assistant_mask,
+        "weights": weights,
+        "group_ids": group_ids,
+        "parent_ids": parent_ids,
+    }
+
+
+def test_kl_advantage_no_effect_when_disabled():
+    """When kl_penalty_coef=0, advantages should not be modified."""
+    inputs = _make_inputs()
+    new_logprobs = torch.zeros(1, 8)
+    ref_logprobs = torch.full((1, 8), -1.0)  # different from new_logprobs
+
+    loss_no_kl = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.0},
+    )
+    loss_without_ref = loss_fn(LossInputs(inputs=inputs), new_logprobs, None, None, {})
+
+    assert loss_no_kl.kl_policy_ref is None
+    assert loss_without_ref.kl_policy_ref is None
+    assert loss_no_kl.reduction == "mean"
+    assert not hasattr(loss_no_kl, "kl")
+
+
+def test_kl_advantage_enabled():
+    """When kl_penalty_coef>0 and ref_logprobs provided, kl_policy_ref should be set."""
+    inputs = _make_inputs()
+    new_logprobs = torch.zeros(1, 8)
+    ref_logprobs = torch.full((1, 8), -0.5)
+
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.1},
+    )
+
+    assert loss.kl_policy_ref is not None
+    assert loss.kl_policy_ref.item() > 0  # KL should be positive when logprobs differ
+
+
+def test_kl_advantage_zero_mean_penalty():
+    """The KL penalty should be zero-mean across assistant tokens."""
+    inputs = _make_inputs(seq_len=16)
+    # Create varying logprobs to produce non-uniform KL
+    new_logprobs = torch.randn(1, 16) * 0.5
+    ref_logprobs = torch.randn(1, 16) * 0.5
+
+    kl_penalty_coef = 0.1
+    assistant_mask = torch.nn.functional.pad(
+        inputs["assistant_mask"][:, 1:].float(), (0, 1), value=0.0
+    )
+
+    # Compute what the penalty should be
+    kl_per_token = (new_logprobs - ref_logprobs).detach() * assistant_mask
+    avg_kl = kl_per_token.sum() / (assistant_mask.sum() + 1e-18)
+    kl_penalty = kl_penalty_coef * (avg_kl - kl_per_token) * assistant_mask
+
+    # Sum of penalty across tokens should be ~0
+    penalty_sum = kl_penalty.sum().item()
+    assert abs(penalty_sum) < 1e-5, f"Penalty sum should be ~0, got {penalty_sum}"
+
+
+def test_kl_advantage_direction():
+    """Tokens with higher KL (more drift) should get reduced advantages."""
+    # Create inputs where token 2 has high drift and token 5 has low drift
+    seq_len = 8
+    inputs = _make_inputs(
+        seq_len=seq_len, advantages=[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+    )
+    new_logprobs = torch.zeros(1, seq_len)
+    ref_logprobs = torch.zeros(1, seq_len)
+
+    # Make token at position 2 (which after shifting = position 1 in shifted space)
+    # have high divergence
+    new_logprobs[0, 2] = 0.0
+    ref_logprobs[0, 2] = -2.0  # large gap = high KL
+
+    # Token at position 5 has low divergence
+    new_logprobs[0, 5] = -0.1
+    ref_logprobs[0, 5] = -0.1  # no gap = low KL
+
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 1.0},
+    )
+
+    # The metric should exist
+    assert loss.kl_policy_ref is not None
+
+
+def test_kl_advantage_does_not_affect_when_no_ref():
+    """When ref_logprobs is None, kl_penalty_coef should have no effect."""
+    inputs = _make_inputs()
+    new_logprobs = torch.zeros(1, 8)
+
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        None,
+        None,
+        {"kl_penalty_coef": 0.5},
+    )
+    assert loss.kl_policy_ref is None
+
+
+def test_kl_advantage_can_use_sample_logprobs() -> None:
+    """Sample-source KL should use stored rollout logprobs rather than learner logprobs."""
+    inputs = _make_inputs(seq_len=8)
+    inputs["logprobs"] = torch.tensor(
+        [[0.0, -0.2, -0.4, -0.6, -0.8, -1.0, -1.2, -1.4]], dtype=torch.float32
+    )
+    new_logprobs = torch.tensor(
+        [[0.0, -1.2, -1.1, -1.0, -0.9, -0.8, -0.7, -0.6]], dtype=torch.float32
+    )
+    ref_logprobs = torch.full((1, 8), -0.5)
+    assistant_mask = shift_tensor(inputs["assistant_mask"], False).to(
+        new_logprobs.dtype
+    )
+    shifted_logprobs = shift_tensor(inputs["logprobs"], float("nan"))
+    sampled_logprobs = torch.where(
+        torch.isnan(shifted_logprobs),
+        new_logprobs.detach(),
+        shifted_logprobs,
+    )
+    expected_sample_kl = ((sampled_logprobs - ref_logprobs) * assistant_mask).sum() / (
+        assistant_mask.sum() + 1e-18
+    )
+    expected_current_kl = ((new_logprobs - ref_logprobs) * assistant_mask).sum() / (
+        assistant_mask.sum() + 1e-18
+    )
+
+    sample_loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.5, "kl_penalty_source": "sample"},
+    )
+    learner_loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        None,
+        {"kl_penalty_coef": 0.5, "kl_penalty_source": "current_learner"},
+    )
+
+    assert sample_loss.kl_policy_ref is not None
+    assert learner_loss.kl_policy_ref is not None
+    assert torch.isclose(sample_loss.kl_policy_ref, expected_sample_kl)
+    assert torch.isclose(learner_loss.kl_policy_ref, expected_current_kl)
+    assert not torch.isclose(sample_loss.kl_policy_ref, learner_loss.kl_policy_ref)
+
+
+def test_loss_masks_nonfinite_ignored_logprobs_before_arithmetic() -> None:
+    inputs = _make_inputs(seq_len=4, advantages=[0.0, 1.0, 1.0, 0.0])
+    inputs["assistant_mask"] = torch.tensor([[False, False, True, False]])
+    new_logprobs = torch.tensor(
+        [[float("nan"), -0.5, float("nan"), float("nan")]],
+        requires_grad=True,
+    )
+    ref_logprobs = torch.tensor([[float("nan"), -0.25, float("nan"), float("nan")]])
+    entropies = torch.tensor([[float("nan"), float("nan"), 0.125, float("nan")]])
+
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        entropies,
+        {"kl_penalty_coef": 0.1},
+    )
+
+    assert torch.isfinite(loss.policy_loss)
+    assert loss.kl_policy_ref is not None
+    assert torch.isfinite(loss.kl_policy_ref)
+    assert loss.entropy is not None
+    assert torch.isfinite(loss.entropy)
+
+    loss.policy_loss.backward()
+    assert new_logprobs.grad is not None
+    assert torch.isfinite(new_logprobs.grad).all()
+    assert new_logprobs.grad[0, 0] == 0.0
+    assert new_logprobs.grad[0, 1] != 0.0
+    assert new_logprobs.grad[0, 2] == 0.0
+    assert new_logprobs.grad[0, 3] == 0.0

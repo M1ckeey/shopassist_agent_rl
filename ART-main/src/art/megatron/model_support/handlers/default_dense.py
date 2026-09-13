@@ -1,0 +1,404 @@
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, Callable, Literal, Sequence
+
+import torch
+
+from art.megatron.model_support.spec import (
+    CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    FlexAttentionCompileCrashConfig,
+    HfWeightSource,
+    LayerFamilyInstance,
+    PrefixTreeModelStateContext,
+    SharedExpertCompileState,
+)
+
+_CONTEXT_PARALLEL_ATTENTION_WORKAROUND_FLAG = "context_parallel_attention"
+_SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG = (
+    "disable_compile_self_attn_linear_proj_reduce_scatter"
+)
+
+
+def _compile_workaround_flags_for_provider(
+    provider: Any,
+    base_flags: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    flags = base_flags
+    if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+        # Megatron's all-to-all dispatcher performs side-stream D2H copies and
+        # record_stream lifetime management inside this method. Those effects
+        # cannot be functionalized by Dynamo and do not benefit from compile.
+        flags = (*flags, "alltoall_dispatch_dtoh")
+        # HybridEP owns native communication, dynamic routing metadata, and
+        # side-stream lifetimes. Keep only Megatron's thin flex wrapper eager.
+        flags = (*flags, "flex_token_dispatch_combine")
+    if (
+        bool(getattr(provider, "sequence_parallel", False))
+        and int(getattr(provider, "tensor_model_parallel_size", 1) or 1) > 1
+    ):
+        flags = (*flags, _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG)
+    if int(getattr(provider, "context_parallel_size", 1) or 1) <= 1:
+        return flags
+    return (*flags, _CONTEXT_PARALLEL_ATTENTION_WORKAROUND_FLAG)
+
+
+class DefaultDenseHandler:
+    key = "default_dense"
+    build_gdn_execution_spec = False
+    has_recurrent_layers = False
+    is_moe = False
+    cp_supported = True
+    native_vllm_lora_status = "disabled"
+
+    def identity_lora_model_config(self, base_config: Any) -> Any:
+        return base_config
+
+    def identity_lora_model_context(self) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def identity_lora_target_parameters(
+        self,
+        model: Any,
+        *,
+        target_modules: list[str],
+    ) -> list[str]:
+        suffixes = self._identity_lora_parameter_suffixes(target_modules)
+        return [name for name, _ in model.named_parameters() if name.endswith(suffixes)]
+
+    def _identity_lora_parameter_suffixes(
+        self,
+        target_modules: list[str],
+    ) -> tuple[str, ...]:
+        target_set = set(target_modules)
+        suffixes: list[str] = []
+        if "q_proj" in target_set:
+            suffixes.append("q_proj.weight")
+        if "k_proj" in target_set:
+            suffixes.append("k_proj.weight")
+        if "v_proj" in target_set:
+            suffixes.append("v_proj.weight")
+        if "o_proj" in target_set:
+            suffixes.append("o_proj.weight")
+        if "gate_proj" in target_set:
+            suffixes.extend(("gate_proj.weight", "mlp.experts.gate_up_proj"))
+        if "up_proj" in target_set:
+            suffixes.extend(("up_proj.weight", "mlp.experts.gate_up_proj"))
+        if "down_proj" in target_set:
+            suffixes.extend(("down_proj.weight", "mlp.experts.down_proj"))
+        if "experts" in target_set:
+            suffixes.extend(("mlp.experts.gate_up_proj", "mlp.experts.down_proj"))
+        return tuple(dict.fromkeys(suffixes))
+
+    def patch_provider(self, provider: Any, bridge: Any) -> None:
+        return None
+
+    def patch_bridge(self, bridge: Any) -> None:
+        del bridge
+        return None
+
+    def hf_weight_source(
+        self,
+        bridge: Any,
+        hf_param: str,
+        *,
+        task: Any | None = None,
+    ) -> HfWeightSource | None:
+        del bridge, hf_param, task
+        return None
+
+    def configure_provider_for_runtime(self, provider: Any) -> None:
+        del provider
+        return None
+
+    def context_parallel_workload_profile(self, provider: Any) -> Any | None:
+        del provider
+        return None
+
+    def default_chat_template(self) -> str | None:
+        return None
+
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        del internal_config
+        return tokenizer
+
+    def vllm_engine_args(self) -> dict[str, object]:
+        return {}
+
+    def vllm_server_args(self) -> dict[str, object]:
+        return {}
+
+    def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def prepare_model_for_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None] | None:
+        del model_chunks
+        return None
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ):
+        del model_chunks
+        return nullcontext()
+
+    def build_prefix_tree_model_state(
+        self,
+        context: PrefixTreeModelStateContext,
+    ) -> dict[str, Any]:
+        del context
+        return {}
+
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]:
+        del model_chunks
+        return state
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]:
+        return "fp32"
+
+    def correctness_use_fp32_lora_reference(self) -> bool:
+        return True
+
+    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any] | None:
+        del oracle_harness
+        return None
+
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]:
+        return oracle_harness.selected_suite_topologies(
+            is_moe=self.is_moe,
+            cp_supported=self.cp_supported,
+        )
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        return tensors, adapter_config
+
+    def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
+        return adapter_config
+
+    def vllm_lora_conversion_is_view_only(self) -> bool:
+        return False
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        del adapter_config
+        return tensors
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return ()
+
+    def _shared_expert_compile_state(
+        self,
+        provider: Any,
+    ) -> SharedExpertCompileState:
+        if int(getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0) <= 0:
+            return "none"
+        if bool(getattr(provider, "moe_shared_expert_overlap", False)):
+            return "shared_expert_overlap"
+        return "shared_experts"
+
+    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        del provider
+        return [
+            LayerFamilyInstance(key="standard_attention", layer_index=0),
+            LayerFamilyInstance(key="dense_mlp", layer_index=0),
+        ]
+
+    def apply_lora_adapters(
+        self,
+        model_chunks: Sequence[Any],
+        provider: Any,
+        *,
+        target_modules: list[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import (
+            _adapter_model_prefix,
+            wrap_split_mlp_lora,
+            wrap_standard_self_attention,
+        )
+
+        target_set = set(target_modules)
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                adapter_model_prefix = _adapter_model_prefix(module)
+                wrap_standard_self_attention(
+                    module.self_attention,
+                    adapter_model_prefix=adapter_model_prefix,
+                    provider=provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                _require_dense_mlp(module)
+                wrap_split_mlp_lora(
+                    module.mlp,
+                    adapter_model_prefix=f"{adapter_model_prefix}.mlp",
+                    provider=provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+
+    def build_adapter_weights_by_base(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> dict[str, list[Any]]:
+        from art.megatron.weights import adapter_export
+
+        return adapter_export.build_transformer_layer_adapter_weights(model_chunks)
+
+    def compile_workaround_config(
+        self,
+        provider: Any,
+    ) -> CompileWorkaroundConfig:
+        return CompileWorkaroundConfig(
+            flags=_compile_workaround_flags_for_provider(provider),
+            shared_expert_state=self._shared_expert_compile_state(provider),
+        )
+
+    def flex_attention_compile_crash_config(
+        self,
+        provider: Any,
+    ) -> FlexAttentionCompileCrashConfig:
+        del provider
+        return FlexAttentionCompileCrashConfig()
+
+    def get_forward_kwargs(self, model: Any, **kwargs: Any) -> dict[str, Any]:
+        del model
+        return {"extra_block_kwargs": kwargs}
+
+
+class DefaultMoeHandler(DefaultDenseHandler):
+    key = "default_moe"
+    is_moe = True
+
+    def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
+        layer_families = [LayerFamilyInstance(key="standard_attention", layer_index=0)]
+        layer_families.append(LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0))
+        if int(getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0) > 0:
+            layer_families.append(
+                LayerFamilyInstance(key="shared_experts_mlp", layer_index=0)
+            )
+        return layer_families
+
+    def apply_lora_adapters(
+        self,
+        model_chunks: Sequence[Any],
+        provider: Any,
+        *,
+        target_modules: list[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.lora import (
+            _adapter_model_prefix,
+            wrap_grouped_moe_experts,
+            wrap_split_mlp_lora,
+            wrap_standard_self_attention,
+        )
+
+        target_set = set(target_modules)
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                adapter_model_prefix = _adapter_model_prefix(module)
+                wrap_standard_self_attention(
+                    module.self_attention,
+                    adapter_model_prefix=adapter_model_prefix,
+                    provider=provider,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                wrap_grouped_moe_experts(
+                    _require_moe_experts(module),
+                    adapter_model_prefix=adapter_model_prefix,
+                    target_modules=target_set,
+                    rank=rank,
+                    alpha=alpha,
+                )
+                shared_experts = getattr(module.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    wrap_split_mlp_lora(
+                        shared_experts,
+                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
+                        provider=provider,
+                        target_modules=target_set,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+
+    def build_adapter_weights_by_base(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> dict[str, list[Any]]:
+        from art.megatron.weights import adapter_export
+
+        return adapter_export.build_transformer_layer_adapter_weights(
+            model_chunks,
+            grouped_moe=True,
+        )
+
+
+def _require_dense_mlp(module: Any) -> None:
+    if getattr(module.mlp, "experts", None) is not None:
+        raise TypeError(
+            "Dense model support handler received a MoE TransformerLayer; "
+            "use a MoE handler for this model."
+        )
+
+
+def _require_moe_experts(module: Any) -> Any:
+    experts = getattr(module.mlp, "experts", None)
+    if experts is None:
+        raise TypeError(
+            "MoE model support handler received a dense TransformerLayer; "
+            "use a dense handler for this model."
+        )
+    return experts
+
+
+DEFAULT_DENSE_HANDLER = DefaultDenseHandler()

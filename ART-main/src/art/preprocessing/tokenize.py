@@ -1,0 +1,1084 @@
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from functools import cached_property
+from itertools import takewhile
+import math
+import random
+from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
+
+import numpy as np
+from openai.types.chat.chat_completion import Choice
+import torch
+from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from transformers.image_processing_utils import BaseImageProcessor
+
+from ..openai import ART_MOE_ROUTING_METADATA_KEY
+from ..trajectories import (
+    ChatCompletionsExchange,
+    ChatCompletionsHistory,
+    ChatCompletionsMessageSource,
+    LegacyHistory,
+    TokenFlag,
+    Trajectory,
+    TrajectoryGroup,
+    _FirstOccurrenceTrie,
+    get_messages,
+)
+from ..trajectories._selection import ModelSelector, resolve_training_model
+from ..types import MessagesAndChoices
+from ..utils.chat_template import (
+    TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR,
+    default_chat_template_kwargs_for_tokenizer,
+    merge_chat_template_kwargs,
+    normalize_tool_call_arguments_for_chat_template,
+)
+from .moe_routing import (
+    MoeRouteArray,
+    MoeRouteSegments,
+    MoeRoutingAlignmentStats,
+    align_choice_routes_to_tokenized_result,
+    choice_moe_routing_metadata,
+)
+from .response_masking import (
+    _TemplatePartTokenizer,
+    response_only_labels,
+    token_ids_for_template_part,
+)
+from .vllm_tokens import choice_vllm_token_metadata
+
+ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
+ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
+
+
+def _flag_spans(flags: list[TokenFlag], flag: TokenFlag) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(flags):
+        if value & flag:
+            start = index if start is None else start
+        elif start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(flags)))
+    return spans
+
+
+def _true_spans(mask: list[bool]) -> list[tuple[int, int]]:
+    return _flag_spans(
+        [TokenFlag.SAMPLED if value else TokenFlag(0) for value in mask],
+        TokenFlag.SAMPLED,
+    )
+
+
+@dataclass(frozen=True)
+class _ChatChoiceTrace:
+    choices: list[Choice]
+    offsets: list[int]
+    lengths: list[int]
+
+
+def _chat_choice_trace(
+    history: ChatCompletionsHistory,
+    token_ids: list[int],
+    flags: list[TokenFlag],
+) -> _ChatChoiceTrace | None:
+    return _chat_source_choice_trace(
+        (
+            (source, source.choice_index)
+            for source in history.message_sources
+            if source is not None
+        ),
+        token_ids,
+        flags,
+    )
+
+
+def _chat_source_choice_trace(
+    sources: Iterable[tuple[object, int | None]],
+    token_ids: list[int],
+    flags: list[TokenFlag],
+) -> _ChatChoiceTrace | None:
+    """Recover per-choice boundaries that adjacent SAMPLED flags cannot represent."""
+
+    sourced_choices: list[Choice] = []
+    seen: set[tuple[int, int]] = set()
+    for source, choice_index in sources:
+        exchange = (
+            source.exchange
+            if isinstance(source, ChatCompletionsMessageSource)
+            else source
+        )
+        if not isinstance(exchange, ChatCompletionsExchange) or choice_index is None:
+            continue
+        key = (id(exchange), choice_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        sourced_choices.append(
+            next(
+                item for item in exchange.response.choices if item.index == choice_index
+            )
+        )
+    if not sourced_choices:
+        return None
+    has_routing = any(
+        choice_moe_routing_metadata(choice) is not None for choice in sourced_choices
+    )
+    if any(choice_vllm_token_metadata(choice) is None for choice in sourced_choices):
+        if has_routing:
+            raise RuntimeError(
+                "MoE routing replay requires exact token IDs for every sourced choice"
+            )
+        return None
+
+    metadata = [choice_vllm_token_metadata(choice) for choice in sourced_choices]
+    if any(value is None for value in metadata):
+        raise AssertionError("choice metadata was checked above")
+    exact_metadata = cast(list[tuple[list[int], list[int]]], metadata)
+
+    choices: list[Choice] = []
+    offsets: list[int] = []
+    lengths: list[int] = []
+    cursor = 0
+    for position, (choice, (prompt_ids, completion_ids)) in enumerate(
+        zip(sourced_choices, exact_metadata, strict=True)
+    ):
+        offset = len(prompt_ids)
+        if (
+            offset < cursor
+            or offset > len(token_ids)
+            or token_ids[:offset] != prompt_ids
+        ):
+            if has_routing:
+                raise RuntimeError(
+                    "MoE routed prompt tokens are absent from tokenized history"
+                )
+            return None
+        next_boundary = (
+            len(exact_metadata[position + 1][0])
+            if position + 1 < len(exact_metadata)
+            else len(token_ids)
+        )
+        end = offset
+        while (
+            end < min(next_boundary, len(token_ids)) and flags[end] & TokenFlag.SAMPLED
+        ):
+            end += 1
+        retained_ids = token_ids[offset:end]
+        if not retained_ids or not completion_ids:
+            if has_routing:
+                raise RuntimeError(
+                    "MoE routed completion tokens are absent from tokenized history"
+                )
+            return None
+        retained_start = len(completion_ids) - len(retained_ids)
+        if retained_start < 0 or completion_ids[retained_start:] != retained_ids:
+            if has_routing:
+                raise RuntimeError(
+                    "MoE routed completion suffix disagrees with tokenized history"
+                )
+            return None
+        choices.append(
+            _choice_with_retained_routing(choice, retained_start)
+            if retained_start
+            else choice
+        )
+        offsets.append(offset)
+        lengths.append(len(retained_ids))
+        cursor = offset + len(retained_ids)
+    return (
+        _ChatChoiceTrace(choices=choices, offsets=offsets, lengths=lengths)
+        if choices
+        else None
+    )
+
+
+def _choice_with_retained_routing(choice: Choice, start: int) -> Choice:
+    """Copy one routed choice while retaining only a completion suffix."""
+
+    routing = choice_moe_routing_metadata(choice)
+    if routing is None:
+        return choice
+    token_metadata = choice_vllm_token_metadata(choice)
+    assert token_metadata is not None
+    prompt_ids, completion_ids = token_metadata
+    routes = routing.get("routed_experts")
+    if not isinstance(routes, np.ndarray):
+        raise RuntimeError("Missing binary routed experts")
+    completion_route_count = len(routes) - len(prompt_ids)
+    if completion_route_count not in {
+        len(completion_ids),
+        max(len(completion_ids) - 1, 0),
+    }:
+        raise RuntimeError(
+            "routed_experts length does not match prompt/completion token ids"
+        )
+    retained = choice.model_copy()
+    extra = retained.model_extra
+    if extra is None:
+        raise RuntimeError("OpenAI Choice.model_extra is unavailable for route replay")
+    extra["token_ids"] = completion_ids[start:]
+    extra[ART_MOE_ROUTING_METADATA_KEY] = {
+        **routing,
+        "completion_token_ids": completion_ids[start:],
+        "routed_experts": np.concatenate(
+            (routes[: len(prompt_ids)], routes[len(prompt_ids) + start :])
+        ),
+    }
+    return retained
+
+
+def _slice_moe_routes(
+    routes: MoeRouteArray | MoeRouteSegments | None, start: int
+) -> MoeRouteArray | MoeRouteSegments | None:
+    if routes is None:
+        return None
+    if isinstance(routes, MoeRouteSegments):
+        if start <= 0:
+            return routes
+        if start >= routes.shape[0]:
+            return MoeRouteArray(
+                np.empty(
+                    (0, routes.shape[1], routes.shape[2]),
+                    dtype=routes.segments[0].dtype,
+                ),
+                num_experts=routes.num_experts,
+                validate=False,
+            )
+        return MoeRouteSegments(
+            segments=tuple(
+                segment for _, segment in routes.iter_slices(start, routes.shape[0])
+            )
+        )
+    return cast(MoeRouteArray, routes[start:])
+
+
+class _TokenDecoder(Protocol):
+    def decode(self, token_ids: int, /) -> str | list[str]: ...
+
+
+class _SFTTokenizer(_TemplatePartTokenizer, Protocol):
+    @property
+    def chat_template(self) -> object: ...
+
+    @property
+    def apply_chat_template(self) -> Callable[..., object]: ...
+
+
+def _chat_template_kwargs(
+    tokenizer: _SFTTokenizer,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return merge_chat_template_kwargs(
+        default_chat_template_kwargs_for_tokenizer(tokenizer),
+        chat_template_kwargs,
+    )
+
+
+def _normalize_tool_for_vllm_openai(tool: ChatTemplateTool) -> ChatTemplateTool:
+    if callable(tool) or not isinstance(tool, dict):
+        return tool
+    if tool.get("type") != "function":
+        return tool
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        return tool
+
+    ordered_function = {
+        key: function[key]
+        for key in ("name", "description", "parameters", "strict")
+        if key in function
+    }
+    ordered_function.update(
+        {key: value for key, value in function.items() if key not in ordered_function}
+    )
+    ordered_tool = {"type": "function", "function": ordered_function}
+    ordered_tool.update(
+        {key: value for key, value in tool.items() if key not in ordered_tool}
+    )
+    return ordered_tool
+
+
+def _normalize_tools_for_chat_template(
+    tools: Any,
+    tool_schema_format: ChatTemplateToolSchemaFormat = "default",
+) -> list[ChatTemplateTool] | None:
+    if tools is None:
+        return None
+    if tool_schema_format not in ("default", "vllm_openai"):
+        raise ValueError(
+            f"Unknown chat template tool schema format: {tool_schema_format}"
+        )
+    normalized_tools: list[ChatTemplateTool] = []
+    for tool in tools:
+        if callable(tool):
+            normalized_tool = tool
+        elif isinstance(tool, dict) and "type" in tool:
+            normalized_tool = cast(dict[Any, Any], tool)
+        else:
+            normalized_tool = {"type": "function", "function": tool}
+        if tool_schema_format == "vllm_openai":
+            normalized_tool = _normalize_tool_for_vllm_openai(normalized_tool)
+        normalized_tools.append(normalized_tool)
+    return normalized_tools
+
+
+def _normalize_tool_call_arguments_for_chat_template(
+    tokenizer: _SFTTokenizer,
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return normalize_tool_call_arguments_for_chat_template(
+        messages,
+        tokenizer.chat_template,
+        require_mapping=bool(
+            getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, False)
+        ),
+    )
+
+
+def _messages_for_chat_template(
+    tokenizer: _SFTTokenizer,
+    messages_and_choices: MessagesAndChoices,
+    *,
+    final_trainable_choice_index: int | None = None,
+) -> list[dict[str, Any]]:
+    messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
+    if (
+        final_trainable_choice_index is not None
+        and 0 <= final_trainable_choice_index < len(messages)
+    ):
+        message = messages[final_trainable_choice_index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            messages[final_trainable_choice_index] = {
+                "role": "assistant",
+                "content": message.get("content") or "",
+            }
+    return _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
+
+
+@dataclass
+class TokenizedResult:
+    advantage: float
+    chat: str
+    token_ids: list[int]
+    input_pos: list[int]
+    assistant_mask: list[int]
+    logprobs: list[float]
+    pixel_values: torch.Tensor | None
+    image_grid_thw: torch.Tensor | None
+    trajectory: Trajectory
+    choice_offsets: list[int]
+    extra_logprobs: dict[str, list[float]]
+    _tokenizer: _TokenDecoder = field(repr=False, compare=False)
+    moe_routed_experts: MoeRouteArray | MoeRouteSegments | None = None
+    moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
+    weight: float = 0.0
+    prompt_id: int = 0
+    prompt_length: int = 0
+
+    @cached_property
+    def tokens(self) -> list[str]:
+        tokens: list[str] = []
+        for token_id in self.token_ids:
+            token = self._tokenizer.decode(token_id)
+            if not isinstance(token, str):
+                raise TypeError("decoding one token must return one string")
+            tokens.append(token)
+        return tokens
+
+    def without_prompt(self) -> "TokenizedResult":
+        return TokenizedResult(
+            advantage=self.advantage,
+            chat=self.chat,
+            token_ids=self.token_ids[self.prompt_length :],
+            input_pos=self.input_pos[self.prompt_length :],
+            assistant_mask=self.assistant_mask[self.prompt_length :],
+            logprobs=self.logprobs[self.prompt_length :],
+            pixel_values=None,
+            image_grid_thw=None,
+            trajectory=self.trajectory,
+            choice_offsets=self.choice_offsets,
+            extra_logprobs={
+                key: values[self.prompt_length :]
+                for key, values in self.extra_logprobs.items()
+            },
+            moe_routed_experts=_slice_moe_routes(
+                self.moe_routed_experts, self.prompt_length
+            ),
+            moe_routing_alignment_stats=self.moe_routing_alignment_stats,
+            _tokenizer=self._tokenizer,
+            weight=self.weight,
+            prompt_id=self.prompt_id,
+            prompt_length=0,
+        )
+
+
+@dataclass
+class SFTBatch:
+    """A batch of tokenized trajectories for supervised fine-tuning.
+    Attributes:
+        trajectory_tensors: List of tensor dictionaries, one per trajectory.
+                           Each dict contains 'input_ids', 'attention_mask', and 'labels'.
+        learning_rate: Learning rate to use for this batch.
+        num_trajectories: Number of trajectories in this batch.
+        num_tokens: Total number of non-padding tokens (attention_mask != 0).
+        num_trainable_tokens: Total number of tokens being trained on (labels != -100).
+        num_dropped_trajectories: Number of overlength trajectories dropped while tokenizing.
+    """
+
+    trajectory_tensors: list[dict[str, torch.Tensor]]
+    learning_rate: float
+    num_trajectories: int
+    num_tokens: int
+    num_trainable_tokens: int
+    num_dropped_trajectories: int = 0
+
+
+def _validate_max_seq_length(max_seq_length: int | None) -> None:
+    if max_seq_length is None:
+        return
+    if max_seq_length < 1:
+        raise ValueError(f"max_seq_length must be positive, got {max_seq_length}")
+
+
+def _apply_chat_template_token_ids(
+    tokenizer: _SFTTokenizer,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> list[int]:
+    output = tokenizer.apply_chat_template(messages, **kwargs)
+    if isinstance(output, BatchEncoding):
+        output = output["input_ids"]
+    if isinstance(output, torch.Tensor):
+        output = output.tolist()
+    assert isinstance(output, list)
+    if output and isinstance(output[0], list):
+        assert len(output) == 1
+        output = output[0]
+    return cast(list[int], output)
+
+
+def _apply_chat_template_text(
+    tokenizer: _SFTTokenizer,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> str:
+    output = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        **kwargs,
+    )
+    if not isinstance(output, str):
+        raise TypeError("Expected the chat template to render one string")
+    return output
+
+
+def _last_assistant_input_ids_and_labels(
+    tokenizer: _SFTTokenizer,
+    messages: list[dict[str, Any]],
+    tools: list[ChatTemplateTool] | None,
+    template_kwargs: dict[str, Any],
+) -> tuple[list[int], list[int]]:
+    if not messages or messages[-1].get("role") != "assistant":
+        raise ValueError(
+            "assistant_turns='last' requires the final message to be an assistant"
+        )
+
+    prompt_text = _apply_chat_template_text(
+        tokenizer,
+        messages[:-1],
+        tools=tools,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    completed_text = _apply_chat_template_text(
+        tokenizer,
+        messages,
+        tools=tools,
+        add_generation_prompt=False,
+        **template_kwargs,
+    )
+    if completed_text.startswith(prompt_text):
+        target_text = completed_text[len(prompt_text) :]
+    else:
+        history_text = _apply_chat_template_text(
+            tokenizer,
+            messages[:-1],
+            tools=tools,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )
+        marker = "__ART_FINAL_ASSISTANT_TARGET__"
+        final_message = messages[-1]
+        has_final_output = any(
+            final_message.get(key)
+            for key in ("content", "reasoning", "reasoning_content", "tool_calls")
+        )
+        marked_text = _apply_chat_template_text(
+            tokenizer,
+            [*messages[:-1], {"role": "assistant", "content": marker}],
+            tools=tools,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )
+        marker_start = marked_text.find(marker)
+        if (
+            not prompt_text.startswith(history_text)
+            or not has_final_output
+            or marker in completed_text
+            or marker_start < 0
+            or completed_text[:marker_start] != marked_text[:marker_start]
+        ):
+            raise ValueError(
+                "Cannot isolate the final assistant response because the completed "
+                "chat does not extend its generation prompt"
+            )
+        target_text = completed_text[marker_start:]
+
+    prompt_ids = token_ids_for_template_part(tokenizer, prompt_text)
+    target_ids = token_ids_for_template_part(tokenizer, target_text)
+    input_ids = [*prompt_ids, *target_ids]
+    labels = [-100] * len(prompt_ids) + target_ids
+    return input_ids, labels
+
+
+def _choice_logprobs(
+    choice: Choice,
+    *,
+    token_count: int,
+    allow_training_without_logprobs: bool,
+) -> tuple[list[float], list[Any]]:
+    if choice.logprobs is None:
+        if allow_training_without_logprobs:
+            return [float("nan")] * token_count, []
+        raise RuntimeError("Trainable vLLM Choice is missing logprobs")
+    token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []
+    if len(token_logprobs) != token_count:
+        raise RuntimeError(
+            "Choice logprob length does not match vLLM completion token ids: "
+            f"{len(token_logprobs)} != {token_count}"
+        )
+    return [float(token_logprob.logprob) for token_logprob in token_logprobs], list(
+        token_logprobs
+    )
+
+
+def _choice_extra_logprobs(
+    *,
+    token_count: int,
+    choice_offsets: list[int],
+    choice_token_logprobs: list[list[Any]],
+) -> dict[str, list[float]]:
+    extra_logprobs: dict[str, list[float]] = {}
+    for start, token_logprobs in zip(choice_offsets, choice_token_logprobs):
+        for i, token_logprob in enumerate(token_logprobs):
+            token_extra_logprobs = (token_logprob.model_extra or {}).get(
+                "extra_logprobs"
+            )
+            if not isinstance(token_extra_logprobs, dict):
+                continue
+            for key, value in token_extra_logprobs.items():
+                extra_logprobs.setdefault(key, [float("nan")] * token_count)[
+                    start + i
+                ] = float("nan") if value is None else float(value)
+    return extra_logprobs
+
+
+def _tokenized_result_from_vllm_choices(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    token_ids: list[int],
+    assistant_mask: list[int],
+    logprobs: list[float],
+    choices: list[Choice],
+    choice_offsets: list[int],
+    choice_token_lengths: list[int],
+    choice_token_logprobs: list[list[Any]],
+    advantage: float,
+    trajectory: Trajectory,
+) -> TokenizedResult:
+    moe_routed_experts, moe_routing_alignment_stats = (
+        align_choice_routes_to_tokenized_result(
+            token_ids=token_ids,
+            choices=choices,
+            choice_offsets=choice_offsets,
+            choice_token_lengths=choice_token_lengths,
+        )
+    )
+    return TokenizedResult(
+        advantage=advantage,
+        chat="",
+        token_ids=token_ids,
+        input_pos=list(range(len(token_ids))),
+        assistant_mask=assistant_mask,
+        logprobs=logprobs,
+        pixel_values=None,
+        image_grid_thw=None,
+        trajectory=trajectory,
+        choice_offsets=choice_offsets,
+        extra_logprobs=_choice_extra_logprobs(
+            token_count=len(token_ids),
+            choice_offsets=choice_offsets,
+            choice_token_logprobs=choice_token_logprobs,
+        ),
+        moe_routed_experts=moe_routed_experts,
+        moe_routing_alignment_stats=moe_routing_alignment_stats,
+        _tokenizer=tokenizer,
+    )
+
+
+def assemble_vllm_training_sequences(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    histories: list[LegacyHistory],
+    advantage: float,
+    allow_training_without_logprobs: bool,
+    trajectory: Trajectory,
+) -> list[TokenizedResult]:
+    """Assemble pretokenized vLLM choices into append-compatible training sequences."""
+    results: list[TokenizedResult] = []
+    token_ids: list[int] = []
+    assistant_mask: list[int] = []
+    logprobs: list[float] = []
+    choices: list[Choice] = []
+    choice_offsets: list[int] = []
+    choice_token_lengths: list[int] = []
+    choice_token_logprobs: list[list[Any]] = []
+
+    def flush() -> None:
+        nonlocal token_ids, assistant_mask, logprobs, choices
+        nonlocal choice_offsets, choice_token_lengths, choice_token_logprobs
+        if not choices:
+            return
+        results.append(
+            _tokenized_result_from_vllm_choices(
+                tokenizer=tokenizer,
+                token_ids=token_ids,
+                assistant_mask=assistant_mask,
+                logprobs=logprobs,
+                choices=choices,
+                choice_offsets=choice_offsets,
+                choice_token_lengths=choice_token_lengths,
+                choice_token_logprobs=choice_token_logprobs,
+                advantage=advantage,
+                trajectory=trajectory,
+            )
+        )
+        token_ids = []
+        assistant_mask = []
+        logprobs = []
+        choices = []
+        choice_offsets = []
+        choice_token_lengths = []
+        choice_token_logprobs = []
+
+    for history in histories:
+        for choice in (
+            item
+            for item in history.messages_and_choices
+            if isinstance(item, Choice)
+            and (item.logprobs is not None or allow_training_without_logprobs)
+        ):
+            metadata = choice_vllm_token_metadata(choice)
+            if metadata is None:
+                raise RuntimeError(
+                    "Trainable Choice is missing vLLM prompt_token_ids/token_ids. "
+                    "Use a vLLM endpoint with return_token_ids enabled."
+                )
+            prompt_token_ids, completion_token_ids = metadata
+            completion_logprobs, token_logprobs = _choice_logprobs(
+                choice,
+                token_count=len(completion_token_ids),
+                allow_training_without_logprobs=allow_training_without_logprobs,
+            )
+            if not token_ids:
+                token_ids.extend(prompt_token_ids)
+                assistant_mask.extend([0] * len(prompt_token_ids))
+                logprobs.extend([float("nan")] * len(prompt_token_ids))
+            elif (
+                len(prompt_token_ids) >= len(token_ids)
+                and prompt_token_ids[: len(token_ids)] == token_ids
+            ):
+                suffix = prompt_token_ids[len(token_ids) :]
+                token_ids.extend(suffix)
+                assistant_mask.extend([0] * len(suffix))
+                logprobs.extend([float("nan")] * len(suffix))
+            else:
+                flush()
+                token_ids.extend(prompt_token_ids)
+                assistant_mask.extend([0] * len(prompt_token_ids))
+                logprobs.extend([float("nan")] * len(prompt_token_ids))
+
+            choice_offsets.append(len(token_ids))
+            choice_token_lengths.append(len(completion_token_ids))
+            choice_token_logprobs.append(token_logprobs)
+            choices.append(choice)
+            token_ids.extend(completion_token_ids)
+            assistant_mask.extend([1] * len(completion_token_ids))
+            logprobs.extend(completion_logprobs)
+    flush()
+    return results
+
+
+def tokenize_trajectory_groups(
+    tokenizer: "PreTrainedTokenizerBase",
+    trajectory_groups: list[TrajectoryGroup],
+    allow_training_without_logprobs: bool,
+    scale_rewards: bool,
+    shuffle_group_trajectories: bool = True,
+    drop_zero_advantage_trajectories: bool = True,
+    image_processor: BaseImageProcessor | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
+    model: ModelSelector | str | None = None,
+    _max_sequence_length: int | None = None,
+) -> Generator["TokenizedResult", None, None]:
+    for prompt_id, group in enumerate(trajectory_groups):
+        if not group:
+            continue
+        results: list[TokenizedResult] = []
+        # Calculate GRPO group mean and standard deviation
+        reward_mean = sum(trajectory.reward for trajectory in group) / len(group)
+        reward_std = math.sqrt(
+            sum((trajectory.reward - reward_mean) ** 2 for trajectory in group)
+            / len(group)
+        )
+        for trajectory in group:
+            # Calculate GRPO advantage for this trajectory
+            advantage = trajectory.reward - reward_mean
+            if scale_rewards:
+                advantage /= reward_std + 1e-6
+            if advantage == 0 and drop_zero_advantage_trajectories:
+                continue
+            if trajectory.exchanges:
+                from ..trajectories._tokenize import (
+                    _as_tokenizer,
+                    _require_causal_predecessor,
+                    _tokenize_trajectory_with_trace,
+                )
+
+                selected_model = resolve_training_model(trajectory, model)
+                exchange_results, traces = _tokenize_trajectory_with_trace(
+                    trajectory,
+                    model=selected_model,
+                    base_model=tokenizer.name_or_path,
+                    tokenizer=_as_tokenizer(tokenizer),
+                    chat_template=None,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+                if any(
+                    not (flag & TokenFlag.EXACT)
+                    for history in exchange_results.histories
+                    for flag in history.flags
+                ):
+                    raise RuntimeError(
+                        "Exchange training requires exact inference-provided token IDs; "
+                        "local tokenization or chat-template rendering was required."
+                    )
+                trajectory_results = []
+                occurrences = _FirstOccurrenceTrie()
+                for exchange_result, trace in zip(
+                    exchange_results.histories, traces, strict=True
+                ):
+                    if (
+                        _max_sequence_length is not None
+                        and len(exchange_result.tokens) > _max_sequence_length
+                    ):
+                        would_train = occurrences.mask(
+                            exchange_result.model,
+                            exchange_result.tokens,
+                            exchange_result.flags,
+                            where=TokenFlag.SAMPLED,
+                            claim=False,
+                        )
+                        if any(would_train):
+                            trajectory_results.append(
+                                TokenizedResult(
+                                    advantage=advantage,
+                                    chat="",
+                                    token_ids=exchange_result.tokens,
+                                    input_pos=list(range(len(exchange_result.tokens))),
+                                    assistant_mask=[0] * len(exchange_result.tokens),
+                                    logprobs=exchange_result.logprobs,
+                                    pixel_values=None,
+                                    image_grid_thw=None,
+                                    trajectory=trajectory,
+                                    choice_offsets=[],
+                                    extra_logprobs={},
+                                    moe_routed_experts=None,
+                                    moe_routing_alignment_stats=MoeRoutingAlignmentStats(),
+                                    _tokenizer=tokenizer,
+                                )
+                            )
+                        continue
+                    trainable = occurrences.mask(
+                        exchange_result.model,
+                        exchange_result.tokens,
+                        exchange_result.flags,
+                        where=TokenFlag.SAMPLED,
+                    )
+                    _require_causal_predecessor(trainable)
+                    if not any(trainable):
+                        continue
+                    choice_spans = _true_spans(trainable)
+                    if not allow_training_without_logprobs and any(
+                        selected and math.isnan(logprob)
+                        for selected, logprob in zip(
+                            trainable,
+                            exchange_result.logprobs,
+                            strict=True,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Exchange trajectory is missing logprobs for trainable tokens"
+                        )
+                    ordered_source_keys = dict.fromkeys(
+                        key for key in trace.source_keys if key is not None
+                    )
+                    chat_trace = _chat_source_choice_trace(
+                        (
+                            (trace.sources[key], key.index)
+                            for key in ordered_source_keys
+                        ),
+                        exchange_result.tokens,
+                        exchange_result.flags,
+                    )
+                    if chat_trace is not None:
+                        selected_choices = [
+                            index
+                            for index, (start, length) in enumerate(
+                                zip(
+                                    chat_trace.offsets,
+                                    chat_trace.lengths,
+                                    strict=True,
+                                )
+                            )
+                            if any(trainable[start : start + length])
+                        ]
+                        moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
+                            token_ids=exchange_result.tokens,
+                            choices=[
+                                chat_trace.choices[index] for index in selected_choices
+                            ],
+                            choice_offsets=[
+                                chat_trace.offsets[index] for index in selected_choices
+                            ],
+                            choice_token_lengths=[
+                                chat_trace.lengths[index] for index in selected_choices
+                            ],
+                        )
+                        choice_spans = [
+                            (
+                                chat_trace.offsets[index],
+                                chat_trace.offsets[index] + chat_trace.lengths[index],
+                            )
+                            for index in selected_choices
+                        ]
+                    else:
+                        moe_routes = None
+                        moe_stats = MoeRoutingAlignmentStats()
+                    trajectory_results.append(
+                        TokenizedResult(
+                            advantage=advantage,
+                            chat="",
+                            token_ids=exchange_result.tokens,
+                            input_pos=list(range(len(exchange_result.tokens))),
+                            assistant_mask=[int(value) for value in trainable],
+                            logprobs=exchange_result.logprobs,
+                            pixel_values=None,
+                            image_grid_thw=None,
+                            trajectory=trajectory,
+                            choice_offsets=[start for start, _ in choice_spans],
+                            extra_logprobs={},
+                            moe_routed_experts=moe_routes,
+                            moe_routing_alignment_stats=moe_stats,
+                            _tokenizer=tokenizer,
+                        )
+                    )
+            else:
+                trajectory_results = assemble_vllm_training_sequences(
+                    tokenizer=tokenizer,
+                    histories=[
+                        LegacyHistory(
+                            messages_and_choices=trajectory.messages_and_choices,
+                            tools=trajectory.tools,
+                        ),
+                        *trajectory.additional_histories,
+                    ],
+                    advantage=advantage,
+                    allow_training_without_logprobs=allow_training_without_logprobs,
+                    trajectory=trajectory,
+                )
+            weight = 1 / (
+                sum(sum(result.assistant_mask) for result in trajectory_results) + 1e-6
+            )
+            for result in trajectory_results:
+                result.weight = weight
+            results.extend(trajectory_results)
+        # Find the longest shared prefix
+        # TODO: Potentially support multiple prompts per group
+        # Initial thought is to sort the results by token_ids and then
+        # successively group prompts with the same prefix.
+        prompt_length = len(
+            list(
+                takewhile(
+                    lambda x: len(set(x)) == 1,
+                    zip(*(r.token_ids for r in results)),
+                )
+            )
+        )
+        first_non_nan_index = min(
+            (
+                next(
+                    (i for i, lp in enumerate(r.logprobs) if not math.isnan(lp)),
+                    len(r.logprobs),
+                )
+                for r in results
+            ),
+            default=0,
+        )
+        prompt_length = max(min(prompt_length, first_non_nan_index) - 1, 0)
+        # Set the prompt id and length
+        for result in results:
+            result.prompt_id = prompt_id
+            result.prompt_length = prompt_length
+        if shuffle_group_trajectories:
+            random.Random(prompt_id).shuffle(results)
+        yield from results
+
+
+def tokenize_trajectory(
+    tokenizer: "PreTrainedTokenizerBase",
+    image_processor: BaseImageProcessor | None,
+    history: LegacyHistory,
+    advantage: float,
+    allow_training_without_logprobs: bool,
+    trajectory: Trajectory,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
+) -> TokenizedResult | None:
+    """
+    Tokenizes a trajectory and returns a TokenizedResult.
+    """
+    del image_processor, chat_template_kwargs, chat_template_tool_schema_format
+    results = assemble_vllm_training_sequences(
+        tokenizer=tokenizer,
+        histories=[history],
+        advantage=advantage,
+        allow_training_without_logprobs=allow_training_without_logprobs,
+        trajectory=trajectory,
+    )
+    if not results:
+        return None
+    if len(results) > 1:
+        raise RuntimeError(
+            "History produced multiple non-append-only vLLM token sequences; "
+            "use assemble_vllm_training_sequences to preserve split histories."
+        )
+    return results[0]
+
+
+def tokenize_sft_batch(
+    trajectory_batch: list[Trajectory],
+    learning_rate: float,
+    tokenizer: _SFTTokenizer,
+    instruction_part: str,
+    response_part: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
+    max_seq_length: int | None = None,
+    assistant_turns: Literal["all", "last"] = "all",
+) -> SFTBatch:
+    """Tokenize a single batch of trajectories for SFT.
+
+    Args:
+        trajectory_batch: List of trajectories in this batch
+        learning_rate: Learning rate for this batch
+        tokenizer: Tokenizer to use for encoding
+        instruction_part: Instruction template part (e.g., "<|im_start|>user")
+        response_part: Response template part (e.g., "<|im_start|>assistant")
+        max_seq_length: Optional maximum tokenized trajectory length. Trajectories
+            longer than this limit are dropped before tensors are created.
+        assistant_turns: Whether to train every assistant turn or only the final one.
+
+    Returns:
+        SFTBatch object for this batch
+    """
+    _validate_max_seq_length(max_seq_length)
+
+    instruction_ids = token_ids_for_template_part(tokenizer, instruction_part)
+    response_ids = token_ids_for_template_part(tokenizer, response_part)
+    # Tokenize all trajectories (no padding — each keeps its natural length)
+    trajectory_tensors = []
+    num_tokens = 0
+    num_trainable_tokens = 0
+    num_dropped_trajectories = 0
+    for trajectory in trajectory_batch:
+        messages = _messages_for_chat_template(
+            tokenizer,
+            trajectory.messages_and_choices,
+        )
+        tools = _normalize_tools_for_chat_template(
+            trajectory.tools,
+            tool_schema_format=chat_template_tool_schema_format,
+        )
+        template_kwargs = _chat_template_kwargs(tokenizer, chat_template_kwargs)
+
+        if assistant_turns == "last":
+            input_ids, labels = _last_assistant_input_ids_and_labels(
+                tokenizer,
+                messages,
+                tools,
+                template_kwargs,
+            )
+        else:
+            # Preserve the existing response-marker behavior for all assistant turns.
+            input_ids = _apply_chat_template_token_ids(
+                tokenizer,
+                messages,
+                tools=tools,
+                tokenize=True,
+                add_generation_prompt=False,
+                **template_kwargs,
+            )
+            labels = response_only_labels(
+                input_ids,
+                instruction_ids=instruction_ids,
+                response_ids=response_ids,
+            )
+        if max_seq_length is not None and len(input_ids) > max_seq_length:
+            num_dropped_trajectories += 1
+            continue
+
+        attention_mask = [1] * len(input_ids)
+
+        trajectory_tensors.append(
+            {
+                "input_ids": torch.tensor([input_ids], dtype=torch.long),
+                "attention_mask": torch.tensor([attention_mask], dtype=torch.long),
+                "labels": torch.tensor([labels], dtype=torch.long),
+            }
+        )
+        num_tokens += sum(attention_mask)
+        num_trainable_tokens += sum(1 for l in labels if l != -100)
+
+    if num_dropped_trajectories:
+        print(
+            "WARNING: Dropped "
+            f"{num_dropped_trajectories}/{len(trajectory_batch)} SFT trajectories "
+            f"because they exceed max_seq_length={max_seq_length}."
+        )
+
+    return SFTBatch(
+        trajectory_tensors=trajectory_tensors,
+        learning_rate=learning_rate,
+        num_trajectories=len(trajectory_tensors),
+        num_tokens=num_tokens,
+        num_trainable_tokens=num_trainable_tokens,
+        num_dropped_trajectories=num_dropped_trajectories,
+    )

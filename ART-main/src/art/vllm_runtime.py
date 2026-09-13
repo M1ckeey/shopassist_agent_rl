@@ -1,0 +1,1003 @@
+import asyncio
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+from typing import Any, Callable, Literal, Mapping, TypedDict
+from urllib.parse import urlparse
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .utils.cache_dirs import configure_model_cache_env, network_cache_warning
+from .utils.lifecycle import (
+    ChildProcessSupervisor,
+    managed_process_cmd,
+    process_shutdown_timeout,
+    terminate_popen_process_group,
+)
+
+RUNTIME_SERVER = "art-vllm-runtime-server"
+RUNTIME_PACKAGE = "art-vllm-runtime"
+RUNTIME_PROTOCOL_VERSION = 1
+RUNTIME_INSTALL_MARKER = "openpipe-art-vllm-runtime"
+_TILELANG_ENV_KEYS = (
+    "PYTHONPATH",
+    "TVM_IMPORT_PYTHON_PATH",
+    "TVM_LIBRARY_PATH",
+    "TL_CUTLASS_PATH",
+    "TL_TEMPLATE_PATH",
+    "TL_COMPOSABLE_KERNEL_PATH",
+)
+_TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang\\")
+_FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
+_ART_FLASHINFER_WORKSPACE_ENV = "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE"
+VLLM_RUNTIME_CLOSE_TIMEOUT = process_shutdown_timeout(1)
+
+
+def _console_progress(message: str) -> None:
+    print(f"ART runtime: {message}", flush=True)
+
+
+def _report_progress(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def _managed_runtime_extra() -> Literal["cuda12", "cuda13"]:
+    override = os.environ.get("ART_VLLM_RUNTIME_CUDA_PROFILE")
+    if override is not None:
+        if override == "cuda12":
+            return "cuda12"
+        if override == "cuda13":
+            return "cuda13"
+        raise ValueError("ART_VLLM_RUNTIME_CUDA_PROFILE must be 'cuda12' or 'cuda13'")
+    cuda_home = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda"))
+    commands = ([str(cuda_home / "bin" / "nvcc"), "--version"], ["nvidia-smi"])
+    for command in commands:
+        try:
+            output = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            ).stdout
+        except FileNotFoundError:
+            continue
+        if "release 13." in output or "CUDA Version: 13." in output:
+            return "cuda13"
+    return "cuda12"
+
+
+MANAGED_RUNTIME_EXTRA = _managed_runtime_extra()
+
+
+class VllmRuntimeLaunchConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    base_model: str
+    port: int
+    host: str = "127.0.0.1"
+    cuda_visible_devices: str | None = None
+    local_gpu_ids: tuple[int, ...] | None = None
+    lora_path: str | None = None
+    served_model_name: str
+    engine_args: dict[str, object] = Field(default_factory=dict)
+    server_args: dict[str, object] = Field(default_factory=dict)
+    nnodes: int = Field(default=1, ge=1)
+    node_rank: int = Field(default=0, ge=0)
+    master_addr: str | None = None
+    master_port: int | None = Field(default=None, ge=1, le=65535)
+    headless: bool = False
+    replica_generation: int = Field(default=0, ge=0)
+    process_uuid: str | None = None
+    update_identity: str | None = None
+    initial_generation_id: str | None = Field(default=None, min_length=1)
+    initial_policy_version: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_native_member(self) -> "VllmRuntimeLaunchConfig":
+        explicit = self.local_gpu_ids
+        if explicit is not None:
+            if not explicit or any(gpu_id < 0 for gpu_id in explicit):
+                raise ValueError("local_gpu_ids must contain non-negative GPU IDs")
+            if len(set(explicit)) != len(explicit):
+                raise ValueError("local_gpu_ids must be unique")
+            visible = ",".join(map(str, explicit))
+            if self.cuda_visible_devices not in (None, visible):
+                raise ValueError("cuda_visible_devices must match local_gpu_ids")
+        elif not self.cuda_visible_devices:
+            raise ValueError("cuda_visible_devices or local_gpu_ids is required")
+        if (self.initial_generation_id is None) != (
+            self.initial_policy_version is None
+        ):
+            raise ValueError(
+                "initial_generation_id and initial_policy_version must be set together"
+            )
+        if self.node_rank >= self.nnodes:
+            raise ValueError("node_rank must be smaller than nnodes")
+        if self.nnodes == 1:
+            if self.node_rank or self.headless or self.master_addr or self.master_port:
+                raise ValueError("single-node launch cannot set native member options")
+        else:
+            if self.master_addr is None or self.master_port is None:
+                raise ValueError(
+                    "multi-node launch requires master_addr and master_port"
+                )
+            if self.headless != (self.node_rank != 0):
+                raise ValueError("exactly nonzero node ranks must be headless")
+        return self
+
+    @property
+    def visible_devices(self) -> str:
+        if self.local_gpu_ids is not None:
+            return ",".join(map(str, self.local_gpu_ids))
+        assert self.cuda_visible_devices is not None
+        return self.cuda_visible_devices
+
+
+class ExternalVllmRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["external"]
+    server_url: str
+    api_key: str | None = None
+    local_checkpoint_root: str | None = None
+    server_checkpoint_root: str | None = None
+    health_timeout_s: float = Field(default=120.0, gt=0)
+
+
+class VllmRuntimeManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    art_package: str = "openpipe-art"
+    art_version: str
+    runtime_package: str = RUNTIME_PACKAGE
+    runtime_version: str
+    protocol_version: int = RUNTIME_PROTOCOL_VERSION
+    python: str
+    runtime_wheel: str
+    runtime_wheel_sha256: str
+    pyproject: str = "pyproject.toml"
+    pyproject_sha256: str
+    lockfile: str = "uv.lock"
+    lockfile_sha256: str
+
+
+class VllmRuntimeInstallMarker(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    managed_by: str = RUNTIME_INSTALL_MARKER
+    runtime_package: str = RUNTIME_PACKAGE
+    runtime_version: str
+    protocol_version: int = RUNTIME_PROTOCOL_VERSION
+    manifest_hash: str
+    runtime_wheel_sha256: str
+    runtime_extra: Literal["cuda12", "cuda13"] = MANAGED_RUNTIME_EXTRA
+    cache_root: str
+
+
+class VllmRuntimeRequestKwargs(TypedDict, total=False):
+    headers: dict[str, str]
+
+
+def is_external_vllm_runtime(config: Mapping[str, Any]) -> bool:
+    runtime_config = config.get("vllm_runtime")
+    return (
+        isinstance(runtime_config, Mapping) and runtime_config.get("mode") == "external"
+    )
+
+
+def get_external_vllm_runtime_config(
+    config: Mapping[str, Any],
+) -> ExternalVllmRuntimeConfig | None:
+    runtime_config = config.get("vllm_runtime")
+    if not isinstance(runtime_config, Mapping):
+        return None
+    if runtime_config.get("mode", "managed") != "external":
+        return None
+    return ExternalVllmRuntimeConfig.model_validate(runtime_config)
+
+
+def normalize_vllm_server_url(server_url: str) -> str:
+    normalized = server_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3].rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            f"External vLLM server_url must be an HTTP URL: {server_url!r}"
+        )
+    return normalized
+
+
+def openai_base_url_from_vllm_server_url(server_url: str) -> str:
+    return f"{normalize_vllm_server_url(server_url)}/v1"
+
+
+def map_checkpoint_path_for_vllm(
+    config: Mapping[str, Any],
+    checkpoint_path: str,
+) -> str:
+    runtime_config = get_external_vllm_runtime_config(config)
+    if runtime_config is None:
+        return checkpoint_path
+    local_root = runtime_config.local_checkpoint_root
+    server_root = runtime_config.server_checkpoint_root
+    if local_root is None and server_root is None:
+        return checkpoint_path
+    if not local_root or not server_root:
+        raise ValueError(
+            "Set both vllm_runtime.local_checkpoint_root and "
+            "vllm_runtime.server_checkpoint_root, or neither."
+        )
+    checkpoint_abs = os.path.abspath(checkpoint_path)
+    local_root_abs = os.path.abspath(local_root)
+    rel_path = os.path.relpath(checkpoint_abs, local_root_abs)
+    if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+        raise ValueError(
+            f"Checkpoint path {checkpoint_path!r} is not under "
+            f"vllm_runtime.local_checkpoint_root {local_root!r}"
+        )
+    return os.path.join(server_root, rel_path)
+
+
+async def wait_for_vllm_http_runtime(
+    *,
+    base_url: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    url = f"{base_url.rstrip('/')}/health"
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                response = await client.get(url, headers=headers, timeout=5.0)
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    f"vLLM runtime did not become ready within {math.ceil(timeout)}s"
+                )
+            await asyncio.sleep(0.5)
+
+
+def _drop_tilelang_env_paths(value: str | None) -> str | None:
+    if value is None:
+        return None
+    kept = [
+        part
+        for part in value.split(os.pathsep)
+        if not any(marker in part for marker in _TILELANG_PATH_MARKERS)
+    ]
+    return os.pathsep.join(kept) if kept else None
+
+
+def _vllm_runtime_subprocess_env(
+    runtime_command: list[str] | None = None,
+) -> dict[str, str]:
+    """Build a child env isolated from runtime-specific JIT path leaks.
+
+    TileLang mutates process env during import. If a vLLM runtime child inherits
+    those paths, spawn workers can load two TVM FFI libraries and abort on
+    duplicate global registration during model load.
+
+    FlashInfer writes absolute source/include paths into generated build.ninja
+    files. Sharing its default ~/.cache/flashinfer across source worktrees can
+    make one runtime compile kernels from another runtime's venv.
+    """
+    env = os.environ.copy()
+    configure_model_cache_env(env)
+    for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        options = [
+            option
+            for option in env.get(key, "").split(",")
+            if option and option != "expandable_segments:True"
+        ]
+        if options:
+            env[key] = ",".join(options)
+        else:
+            env.pop(key, None)
+    service_prefixes = {
+        key.removesuffix("_SERVICE_HOST")
+        for key in env
+        if key.startswith("VLLM_") and key.endswith("_SERVICE_HOST")
+    }
+    for key in tuple(env):
+        if any(
+            key.startswith(f"{prefix}_SERVICE_")
+            or key == f"{prefix}_PORT"
+            or key.startswith(f"{prefix}_PORT_")
+            for prefix in service_prefixes
+        ):
+            env.pop(key)
+    for key in _TILELANG_ENV_KEYS:
+        value = _drop_tilelang_env_paths(env.get(key))
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    runtime_dir = (
+        _runtime_dir_from_bin(Path(runtime_command[0])) if runtime_command else None
+    )
+    if runtime_dir is not None:
+        env.pop("PYTHONPATH", None)
+        env["PATH"] = os.pathsep.join(
+            (str(runtime_dir / ".venv" / "bin"), env.get("PATH", ""))
+        )
+        nvidia_libs = sorted(
+            str(path)
+            for site_packages in (runtime_dir / ".venv" / "lib").glob(
+                "python*/site-packages"
+            )
+            for path in (site_packages / "nvidia").glob("*/lib")
+            if path.is_dir()
+        )
+        inherited = env.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            (*nvidia_libs, *(path for path in inherited if "/nvidia/" not in path))
+        )
+    env[_FLASHINFER_WORKSPACE_ENV] = str(_vllm_runtime_flashinfer_workspace_base())
+    return env
+
+
+class ManagedVllmRuntime:
+    def __init__(self, *, host: str = "127.0.0.1") -> None:
+        self.host = host
+        self.port = 0
+        self.api_key: str | None = None
+        self.process: subprocess.Popen[Any] | None = None
+        self.log_file: Any = None
+        self.log_path: str | None = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def request_kwargs(self) -> VllmRuntimeRequestKwargs:
+        if self.api_key is None:
+            return {}
+        return {"headers": {"Authorization": f"Bearer {self.api_key}"}}
+
+    async def start(
+        self,
+        *,
+        launch_config: VllmRuntimeLaunchConfig,
+        output_dir: str,
+        child_processes: ChildProcessSupervisor,
+        install_parent_cleanup: Callable[[], None],
+        cleanup_on_error: Callable[[], None] | None = None,
+        timeout: float | None = None,
+    ) -> tuple[str, int]:
+        self.host = launch_config.host
+        self.port = launch_config.port
+        api_key = launch_config.server_args.get("api_key")
+        if api_key is not None and (not isinstance(api_key, str) or not api_key):
+            raise ValueError("vLLM api_key must be a non-empty string")
+        self.api_key = api_key
+
+        cmd = build_vllm_runtime_server_cmd(launch_config)
+        install_parent_cleanup()
+        log_dir = os.path.join(output_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_path = os.path.join(log_dir, "vllm-runtime.log")
+        self.log_file = open(self.log_path, "w", buffering=1)
+        env = _vllm_runtime_subprocess_env(cmd)
+        env.pop("VLLM_API_KEY", None)
+        if self.api_key is not None:
+            env["VLLM_API_KEY"] = self.api_key
+        self.process = subprocess.Popen(
+            managed_process_cmd(cmd),
+            cwd=str(_vllm_runtime_subprocess_cwd(cmd)),
+            env={
+                **env,
+                "CUDA_VISIBLE_DEVICES": launch_config.visible_devices,
+            },
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+        runtime_timeout = (
+            timeout
+            if timeout is not None
+            else float(os.environ.get("ART_DEDICATED_VLLM_TIMEOUT", 1200))
+        )
+        if launch_config.headless:
+            await asyncio.sleep(0.1)
+            if self.process.poll() is not None:
+                returncode = self.process.returncode
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise RuntimeError(
+                    f"headless vLLM member exited with code {returncode}. "
+                    f"Check logs at {log_path}"
+                )
+            assert self.log_path is not None
+            child_processes.watch_popen(
+                f"vLLM headless member {launch_config.node_rank}",
+                self.process,
+                log_path=self.log_path,
+            )
+            return self.host, self.port
+
+        async with httpx.AsyncClient() as client:
+            try:
+                await wait_for_vllm_runtime(
+                    process=self.process,
+                    host=self.host,
+                    port=self.port,
+                    timeout=runtime_timeout,
+                    log_path=self.log_path,
+                )
+            except TimeoutError as exc:
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise TimeoutError(
+                    "vLLM subprocess did not become ready within "
+                    f"{runtime_timeout}s. Check logs at {log_path}"
+                ) from exc
+            except RuntimeError as exc:
+                returncode = self.process.returncode
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise RuntimeError(
+                    f"vLLM subprocess failed during startup "
+                    f"(returncode={returncode}): {exc}. "
+                    f"Check logs at {log_path}"
+                ) from exc
+
+            if launch_config.process_uuid is not None:
+                try:
+                    response = await client.get(
+                        f"{self.base_url}/art/state",
+                        **self.request_kwargs(),
+                        timeout=5.0,
+                    )
+                    response.raise_for_status()
+                    state = response.json()
+                    expected = {
+                        "process_uuid": launch_config.process_uuid,
+                        "generation": launch_config.replica_generation,
+                    }
+                    if any(state.get(key) != value for key, value in expected.items()):
+                        raise RuntimeError(
+                            f"vLLM /art/state identity mismatch: {state!r}"
+                        )
+                except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                    log_path = self.log_path
+                    self._cleanup_after_start_error(cleanup_on_error)
+                    raise RuntimeError(
+                        "vLLM passed readiness but /art/state was invalid. "
+                        f"Check logs at {log_path}"
+                    ) from exc
+
+            try:
+                response = await client.get(
+                    f"{self.base_url}/v1/models",
+                    **self.request_kwargs(),
+                    timeout=5.0,
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                log_path = self.log_path
+                self._cleanup_after_start_error(cleanup_on_error)
+                raise RuntimeError(
+                    "vLLM passed /health but /v1/models was not reachable. "
+                    f"Check logs at {log_path}"
+                ) from exc
+
+        assert self.process is not None
+        assert self.log_path is not None
+        child_processes.watch_popen(
+            "vLLM runtime",
+            self.process,
+            log_path=self.log_path,
+        )
+        return self.host, self.port
+
+    def close(self) -> None:
+        if self.process is not None:
+            terminate_popen_process_group(
+                self.process,
+                timeout=float(
+                    os.environ.get(
+                        "ART_VLLM_RUNTIME_CLOSE_TIMEOUT",
+                        VLLM_RUNTIME_CLOSE_TIMEOUT,
+                    )
+                ),
+            )
+            self.process = None
+        if self.log_file is not None:
+            self.log_file.close()
+            self.log_file = None
+        self.log_path = None
+        self.api_key = None
+        self.port = 0
+
+    def _cleanup_after_start_error(
+        self, cleanup_on_error: Callable[[], None] | None
+    ) -> None:
+        if cleanup_on_error is None:
+            self.close()
+        else:
+            cleanup_on_error()
+
+
+def get_vllm_runtime_project_root() -> Path:
+    override = os.environ.get("ART_VLLM_RUNTIME_PROJECT_ROOT")
+    if override:
+        return Path(override).resolve()
+    return Path(__file__).resolve().parents[2] / "vllm_runtime"
+
+
+def get_vllm_runtime_working_dir() -> Path:
+    runtime_root = get_vllm_runtime_project_root()
+    if runtime_root.exists():
+        return runtime_root
+    return Path.cwd()
+
+
+def get_vllm_runtime_cache_root() -> Path:
+    override = os.environ.get("ART_VLLM_RUNTIME_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    return configure_model_cache_env(os.environ.copy()) / "vllm_runtime"
+
+
+def _vllm_runtime_flashinfer_workspace_base() -> Path:
+    override = os.environ.get(_ART_FLASHINFER_WORKSPACE_ENV)
+    if override:
+        return Path(override).expanduser()
+    return get_vllm_runtime_cache_root().expanduser() / "flashinfer_workspace"
+
+
+def _bundled_runtime_dir() -> Path:
+    return Path(__file__).resolve().parent / "_vllm_runtime"
+
+
+def _source_runtime_bin() -> Path:
+    return get_vllm_runtime_project_root() / ".venv" / "bin" / RUNTIME_SERVER
+
+
+def _runtime_bin(runtime_dir: Path) -> Path:
+    return runtime_dir / ".venv" / "bin" / RUNTIME_SERVER
+
+
+def _runtime_python(runtime_dir: Path) -> Path:
+    return runtime_dir / ".venv" / "bin" / "python"
+
+
+def _runtime_dir_from_bin(runtime_bin: Path) -> Path | None:
+    runtime_bin = runtime_bin.expanduser().resolve()
+    if (
+        runtime_bin.name == RUNTIME_SERVER
+        and runtime_bin.parent.name == "bin"
+        and runtime_bin.parent.parent.name == ".venv"
+    ):
+        return runtime_bin.parent.parent.parent
+    return None
+
+
+def _vllm_runtime_subprocess_cwd(runtime_command: list[str] | None = None) -> Path:
+    runtime_dir = (
+        _runtime_dir_from_bin(Path(runtime_command[0])) if runtime_command else None
+    )
+    return runtime_dir or get_vllm_runtime_working_dir()
+
+
+def _is_executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest_hash(manifest: VllmRuntimeManifest) -> str:
+    payload = json.dumps(
+        {"manifest": manifest.model_dump(), "runtime_extra": MANAGED_RUNTIME_EXTRA},
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _load_bundled_manifest(bundle_dir: Path | None = None) -> VllmRuntimeManifest:
+    bundle_dir = bundle_dir or _bundled_runtime_dir()
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(
+            "ART vLLM runtime bundle is missing. Reinstall openpipe-art from a "
+            "wheel built with scripts/build_package.py or set ART_VLLM_RUNTIME_BIN."
+        )
+    return VllmRuntimeManifest.model_validate_json(manifest_path.read_text())
+
+
+def _run_install_command(command: list[str], *, cwd: Path | None = None) -> None:
+    try:
+        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "uv is required to install ART's managed vLLM runtime. Install uv or "
+            "set ART_VLLM_RUNTIME_BIN to an existing runtime server."
+        ) from exc
+    if result.returncode == 0:
+        return
+    output = (result.stdout + result.stderr)[-4000:]
+    raise RuntimeError(
+        "Failed to install ART's managed vLLM runtime with command "
+        f"{shlex.join(command)}.\n{output}"
+    )
+
+
+@contextmanager
+def _runtime_install_lock(cache_root: Path):
+    cache_root.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_root / ".install.lock"
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _install_marker_path(runtime_dir: Path) -> Path:
+    return runtime_dir / "install.json"
+
+
+def _read_install_marker(runtime_dir: Path) -> VllmRuntimeInstallMarker | None:
+    marker_path = _install_marker_path(runtime_dir)
+    if not marker_path.exists():
+        return None
+    try:
+        return VllmRuntimeInstallMarker.model_validate_json(marker_path.read_text())
+    except ValueError:
+        return None
+
+
+def _is_managed_runtime_dir(
+    runtime_dir: Path,
+    *,
+    cache_root: Path,
+    expected_hash: str | None = None,
+) -> bool:
+    if not runtime_dir.is_dir():
+        return False
+    if runtime_dir.resolve().parent != cache_root.resolve():
+        return False
+    if len(runtime_dir.name) != 64 or any(
+        c not in "0123456789abcdef" for c in runtime_dir.name
+    ):
+        return False
+    if expected_hash is not None and runtime_dir.name != expected_hash:
+        return False
+    marker = _read_install_marker(runtime_dir)
+    if marker is None:
+        return False
+    if marker.managed_by != RUNTIME_INSTALL_MARKER:
+        return False
+    if marker.runtime_package != RUNTIME_PACKAGE:
+        return False
+    if marker.manifest_hash != runtime_dir.name:
+        return False
+    if marker.cache_root != str(cache_root.resolve()):
+        return False
+    if not (runtime_dir / ".venv" / "pyvenv.cfg").exists():
+        return False
+    return True
+
+
+def _validate_managed_runtime(
+    runtime_dir: Path,
+    *,
+    cache_root: Path,
+    manifest: VllmRuntimeManifest,
+    manifest_hash: str,
+) -> Path | None:
+    if not _is_managed_runtime_dir(
+        runtime_dir, cache_root=cache_root, expected_hash=manifest_hash
+    ):
+        return None
+    marker = _read_install_marker(runtime_dir)
+    if marker is None:
+        return None
+    if marker.runtime_version != manifest.runtime_version:
+        return None
+    if marker.protocol_version != manifest.protocol_version:
+        return None
+    if marker.runtime_wheel_sha256 != manifest.runtime_wheel_sha256:
+        return None
+    if marker.runtime_extra != MANAGED_RUNTIME_EXTRA:
+        return None
+    runtime_bin = _runtime_bin(runtime_dir)
+    if not _is_executable_file(runtime_bin):
+        return None
+    return runtime_bin
+
+
+def _cleanup_old_managed_runtimes(cache_root: Path, *, keep_hash: str) -> None:
+    if os.environ.get("ART_VLLM_RUNTIME_KEEP_OLD"):
+        return
+    if not cache_root.exists():
+        return
+    for child in cache_root.iterdir():
+        if child.name == keep_hash:
+            continue
+        if not _is_managed_runtime_dir(child, cache_root=cache_root):
+            continue
+        shutil.rmtree(child)
+
+
+def _install_managed_runtime(
+    *,
+    bundle_dir: Path,
+    cache_root: Path,
+    manifest: VllmRuntimeManifest,
+    manifest_hash: str,
+    progress: Callable[[str], None] | None = None,
+) -> Path:
+    runtime_wheel = bundle_dir / manifest.runtime_wheel
+    if _sha256_file(runtime_wheel) != manifest.runtime_wheel_sha256:
+        raise RuntimeError(f"Bundled vLLM runtime wheel hash mismatch: {runtime_wheel}")
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{manifest_hash}.tmp-", dir=str(cache_root.resolve()))
+    )
+    runtime_dir = cache_root / manifest_hash
+    promoted = False
+    try:
+        shutil.copy2(bundle_dir / manifest.pyproject, stage / "pyproject.toml")
+        shutil.copy2(bundle_dir / manifest.lockfile, stage / "uv.lock")
+        started = time.perf_counter()
+        _report_progress(
+            progress,
+            f"installing vLLM {MANAGED_RUNTIME_EXTRA} dependencies in {cache_root}",
+        )
+        _run_install_command(
+            [
+                "uv",
+                "sync",
+                "--project",
+                str(stage),
+                "--extra",
+                MANAGED_RUNTIME_EXTRA,
+                "--frozen",
+                "--no-install-project",
+                "--no-dev",
+            ]
+        )
+        _report_progress(
+            progress,
+            f"installed vLLM dependencies in {time.perf_counter() - started:.1f}s",
+        )
+        if runtime_dir.exists():
+            existing = _validate_managed_runtime(
+                runtime_dir,
+                cache_root=cache_root,
+                manifest=manifest,
+                manifest_hash=manifest_hash,
+            )
+            if existing is not None:
+                shutil.rmtree(stage)
+                return existing
+            raise RuntimeError(
+                f"Refusing to replace invalid vLLM runtime cache directory: {runtime_dir}"
+            )
+        stage.rename(runtime_dir)
+        promoted = True
+        runtime_python = _runtime_python(runtime_dir)
+        started = time.perf_counter()
+        _report_progress(progress, "installing ART's pinned vLLM runtime server")
+        _run_install_command(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--no-deps",
+                "--python",
+                str(runtime_python),
+                str(runtime_wheel),
+            ]
+        )
+        _report_progress(
+            progress,
+            f"installed vLLM runtime server in {time.perf_counter() - started:.1f}s",
+        )
+        runtime_bin = _runtime_bin(runtime_dir)
+        if not _is_executable_file(runtime_bin):
+            raise RuntimeError(f"vLLM runtime server was not installed: {runtime_bin}")
+
+        marker = VllmRuntimeInstallMarker(
+            runtime_version=manifest.runtime_version,
+            protocol_version=manifest.protocol_version,
+            manifest_hash=manifest_hash,
+            runtime_wheel_sha256=manifest.runtime_wheel_sha256,
+            runtime_extra=MANAGED_RUNTIME_EXTRA,
+            cache_root=str(cache_root.resolve()),
+        )
+        _install_marker_path(runtime_dir).write_text(
+            json.dumps(marker.model_dump(), indent=2, sort_keys=True) + "\n"
+        )
+        _cleanup_old_managed_runtimes(cache_root, keep_hash=manifest_hash)
+        return runtime_bin
+    except Exception:
+        shutil.rmtree(runtime_dir if promoted else stage, ignore_errors=True)
+        raise
+
+
+def ensure_vllm_runtime(*, progress: Callable[[str], None] | None = None) -> Path:
+    configure_model_cache_env()
+    bundle_dir = _bundled_runtime_dir()
+    manifest = _load_bundled_manifest(bundle_dir)
+    manifest_hash = _manifest_hash(manifest)
+    cache_root = get_vllm_runtime_cache_root()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_root = cache_root.resolve()
+    runtime_dir = cache_root / manifest_hash
+
+    with _runtime_install_lock(cache_root):
+        existing = _validate_managed_runtime(
+            runtime_dir,
+            cache_root=cache_root,
+            manifest=manifest,
+            manifest_hash=manifest_hash,
+        )
+        if existing is not None:
+            _cleanup_old_managed_runtimes(cache_root, keep_hash=manifest_hash)
+            _report_progress(progress, f"using cached vLLM runtime at {runtime_dir}")
+            return existing
+        if warning := network_cache_warning(cache_root):
+            _report_progress(progress, f"Warning: {warning}")
+        return _install_managed_runtime(
+            bundle_dir=bundle_dir,
+            cache_root=cache_root,
+            manifest=manifest,
+            manifest_hash=manifest_hash,
+            progress=progress,
+        )
+
+
+def _resolve_vllm_runtime_python() -> Path:
+    runtime_command = _runtime_command_prefix()
+    runtime_dir = _runtime_dir_from_bin(Path(runtime_command[0]))
+    if runtime_dir is None:
+        raise RuntimeError(
+            "ART_VLLM_RUNTIME_BIN must point directly to a "
+            ".venv/bin/art-vllm-runtime-server executable"
+        )
+    return _runtime_python(runtime_dir)
+
+
+def _runtime_command_prefix(
+    *, progress: Callable[[str], None] | None = None
+) -> list[str]:
+    override = os.environ.get("ART_VLLM_RUNTIME_BIN")
+    if override:
+        command = shlex.split(override)
+        runtime_dir = _runtime_dir_from_bin(Path(command[0]))
+        if runtime_dir is not None:
+            command[0] = str(_runtime_bin(runtime_dir))
+        return command
+    runtime_bin = _source_runtime_bin()
+    if runtime_bin.exists():
+        return [str(runtime_bin)]
+    runtime_root = get_vllm_runtime_project_root()
+    if (
+        runtime_root.exists()
+        and not (_bundled_runtime_dir() / "manifest.json").exists()
+    ):
+        raise RuntimeError(
+            "vLLM runtime env is not built. Run `uv sync` in "
+            f"{runtime_root} or set ART_VLLM_RUNTIME_BIN."
+        )
+    return [str(ensure_vllm_runtime(progress=progress))]
+
+
+def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
+    server_args = {
+        key: value for key, value in config.server_args.items() if key != "api_key"
+    }
+    command = [
+        *_runtime_command_prefix(progress=_console_progress),
+        f"--model={config.base_model}",
+        f"--port={config.port}",
+        f"--host={config.host}",
+        f"--cuda-visible-devices={config.visible_devices}",
+    ]
+    if config.lora_path is not None:
+        command.append(f"--lora-path={config.lora_path}")
+    command.extend(
+        [
+            f"--served-model-name={config.served_model_name}",
+            f"--engine-args-json={json.dumps(config.engine_args)}",
+            f"--server-args-json={json.dumps(server_args)}",
+        ]
+    )
+    if config.nnodes > 1:
+        command.extend(
+            [
+                f"--nnodes={config.nnodes}",
+                f"--node-rank={config.node_rank}",
+                f"--master-addr={config.master_addr}",
+                f"--master-port={config.master_port}",
+            ]
+        )
+        if config.headless:
+            command.append("--headless")
+    if config.process_uuid is not None:
+        command.extend(
+            [
+                f"--replica-generation={config.replica_generation}",
+                f"--process-uuid={config.process_uuid}",
+            ]
+        )
+    if config.update_identity is not None:
+        command.append(f"--update-identity={config.update_identity}")
+    if config.initial_generation_id is not None:
+        command.append(f"--initial-generation-id={config.initial_generation_id}")
+    if config.initial_policy_version is not None:
+        command.append(f"--initial-policy-version={config.initial_policy_version}")
+    return command
+
+
+async def wait_for_vllm_runtime(
+    *,
+    process: subprocess.Popen[Any],
+    host: str,
+    port: int,
+    timeout: float,
+    log_path: str | None = None,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    url = f"http://{host}:{port}/health"
+    log_offset = 0
+    log_tail = ""
+    fatal_markers = (
+        "EngineCore failed to start",
+        "Engine core initialization failed",
+    )
+    async with httpx.AsyncClient() as client:
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"vLLM runtime exited with code {process.returncode}"
+                )
+            if log_path is not None:
+                try:
+                    with open(log_path, "rb") as log:
+                        log.seek(log_offset)
+                        payload = log.read()
+                        log_offset = log.tell()
+                except FileNotFoundError:
+                    payload = b""
+                log_tail = (log_tail + payload.decode(errors="replace"))[-8192:]
+                if marker := next(
+                    (marker for marker in fatal_markers if marker in log_tail), None
+                ):
+                    raise RuntimeError(f"vLLM reported fatal startup failure: {marker}")
+            try:
+                response = await client.get(url, timeout=5.0)
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    f"vLLM runtime did not become ready within {math.ceil(timeout)}s"
+                )
+            await asyncio.sleep(0.5)

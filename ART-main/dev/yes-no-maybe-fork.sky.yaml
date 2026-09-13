@@ -1,0 +1,38 @@
+name: yes-no-maybe-fork
+
+workdir: .
+
+resources:
+  accelerators: ["H200:1", "H100-SXM:1", "H100:1", "A100-80GB:1"]
+  image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
+  ports:
+    - 7999 # main ART server
+    - 8000 # vLLM server
+
+envs:
+  GIT_RESET_CLEAN: "false" # preserve workdir files synced by SkyPilot
+  INSTALL_EXTRAS: "false"
+  PYTHONUTF8: "1"
+  GIT_USER_NAME: "Your Name"
+  GIT_USER_EMAIL: "your.email@example.com"
+  WANDB_API_KEY: "" # set via: sky launch --env WANDB_API_KEY=<key>
+
+setup: |
+  ./scripts/setup.sh
+
+run: |
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  .venv/bin/python dev/yes-no-maybe-fork.py
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 604800
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy
